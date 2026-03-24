@@ -194,6 +194,10 @@ setup_python_env() {
   export UV_PROJECT_ENVIRONMENT="$APP_DIR/env"
   uv sync --no-dev
 
+  #FS
+  env/bin/python -m ensurepip --upgrade
+  env/bin/python -m pip install --upgrade pip
+
   env/bin/python -m pip install -q gunicorn
 EOSU
 
