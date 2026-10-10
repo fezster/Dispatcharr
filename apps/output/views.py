@@ -524,7 +524,7 @@ def _generate_dvr_playlist_token(recording_id, expires_seconds=86400):
     No user association needed - the token just carries the recording_id claim.
     """
     token = AccessToken()
-    token.set_exp(from_time=timezone.now() + timedelta(seconds=expires_seconds))
+    token.set_exp(from_time=django_timezone.now() + timedelta(seconds=expires_seconds))
     token["rec_id"] = str(recording_id)
     token["type"] = "dvr_playlist"
     return str(token)
