@@ -1491,6 +1491,11 @@ def stream_xc_episode(request, username, password, stream_id, extension):
         return JsonResponse({"error": "Forbidden"}, status=403)
 
     from apps.vod.models import M3UEpisodeRelation
+    from apps.channels.models import Recording
+    from apps.channels.dvr_access import is_dvr_view_enabled, recordings_queryset_for_user
+    from django.utils import timezone as django_timezone
+    from datetime import timedelta
+    from rest_framework_simplejwt.tokens import AccessToken
 
     session_id = request.GET.get('session_id')
     profile_id = request.GET.get('profile_id')
@@ -1511,8 +1516,52 @@ def stream_xc_episode(request, username, password, stream_id, extension):
     if not is_vod_series_enabled(user=user):
         return JsonResponse({"error": "Forbidden"}, status=403)
 
-    # Users with series access get episodes from all active M3U accounts
-    filters = {"episode_id": stream_id, "m3u_account__is_active": True}
+    # Handle DVR recordings (negative stream_id = -recording_id)
+    try:
+        stream_id_int = int(stream_id)
+    except (ValueError, TypeError):
+        return JsonResponse({"error": "Episode not found"}, status=404)
+
+    if stream_id_int < 0:
+        # DVR recording playback
+        recording_id = -stream_id_int
+        if not is_dvr_view_enabled(user=user):
+            return JsonResponse({"error": "Forbidden"}, status=403)
+
+        # Check if user can access this recording
+        recording = recordings_queryset_for_user(
+            Recording.objects.filter(pk=recording_id), user
+        ).first()
+        if not recording:
+            return JsonResponse({"error": "Episode not found"}, status=404)
+
+        # Generate token for playback
+        token = AccessToken()
+        token.set_exp(from_time=django_timezone.now() + timedelta(seconds=3600))
+        token["rec_id"] = str(recording_id)
+        token["type"] = "dvr_playlist"
+
+        # Determine playback URL (HLS for in-progress, file for completed)
+        cp = recording.custom_properties or {}
+        hls_dir = cp.get("_hls_dir")
+        file_path = cp.get("file_path")
+
+        from core.utils import build_absolute_uri_with_port
+        base_url = build_absolute_uri_with_port(request, "")
+
+        if hls_dir:
+            playback_url = f"{base_url}/api/channels/recordings/{recording_id}/hls/index.m3u8"
+        elif file_path:
+            playback_url = f"{base_url}/api/channels/recordings/{recording_id}/file/"
+        else:
+            return JsonResponse({"error": "Episode not found"}, status=404)
+
+        # Redirect to playback URL with token
+        playback_url = f"{playback_url}?token={token}"
+        return HttpResponseRedirect(playback_url)
+
+    # Provider VOD series episode (existing logic)
+    filters = {"episode_id": stream_id_int, "m3u_account__is_active": True}
 
     episode_relation = M3UEpisodeRelation.objects.select_related('episode').filter(**filters).order_by('-m3u_account__priority', 'id').first()
     if not episode_relation:
