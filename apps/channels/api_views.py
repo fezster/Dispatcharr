@@ -3609,11 +3609,30 @@ class RecordingViewSet(viewsets.ModelViewSet):
             and within their user_level.
           * Users without DVR view/manage → denied.
 
+        Additionally, accepts DVR playlist tokens (type=dvr_playlist) passed
+        via ?token= query parameter. These tokens are recording-scoped (rec_id
+        claim) and allow playback without a user session.
+
         The network_access_allowed(request, "STREAMS") check applied
         before this is a network-perimeter gate (e.g. block external IPs
         from streaming at all); it is not a substitute for per-user
         authorization.
         """
+        # Check for DVR playlist token first (allows playback without user auth)
+        from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        params = getattr(request, "query_params", request.GET)
+        token_str = params.get("token")
+        if token_str:
+            try:
+                token = AccessToken(token_str)
+                # Validate it's a DVR playlist token for this recording
+                if token.get("type") == "dvr_playlist" and str(token.get("rec_id")) == str(recording.id):
+                    return True
+            except (InvalidToken, TokenError):
+                pass
+
         user = getattr(request, "user", None)
         if not user or not getattr(user, "is_authenticated", False):
             return False
