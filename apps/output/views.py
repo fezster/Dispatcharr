@@ -1742,8 +1742,9 @@ def xc_get_series(request, user, category_id=None):
     append = series_list.append
     num = 0
 
-    # Provider series (existing logic)
-    if category_id != "dvr":
+    # Provider series (existing logic) - skip for all DVR categories
+    is_dvr_category = category_id in ("dvr", "dvr_in_progress") or (category_id and category_id.startswith("dvr_date_"))
+    if not is_dvr_category:
         rel_filters = {"m3u_account__is_active": True}
         if category_id:
             rel_filters["category_id"] = category_id
