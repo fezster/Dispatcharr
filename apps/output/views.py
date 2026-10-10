@@ -1908,7 +1908,7 @@ def xc_get_series_info(request, user, series_id):
                 "episode_num": episode_num,
                 "title": title,
                 "container_extension": "mp4",
-                "added": str(int(rec.created_at.timestamp())),
+                "added": str(int(rec.start_time.timestamp())),
                 "custom_sid": None,
                 "direct_source": playback_url,  # Direct playback URL with token
                 "info": {
