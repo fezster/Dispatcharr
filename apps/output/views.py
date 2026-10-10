@@ -1785,6 +1785,13 @@ def xc_get_series(request, user, category_id=None):
         channel_ids = recordings_qs.values_list('channel_id', flat=True).distinct()
         channels = Channel.objects.filter(id__in=channel_ids).select_related('logo', 'channel_group')
 
+        # Precompute channel logo URL parts (uses /api/channels/logo/, not VOD logo)
+        base_url = build_absolute_uri_with_port(request, "")
+        logo_sample_path = reverse("api:channels:logo-cache", args=[0])
+        logo_prefix_raw, _, logo_suffix_raw = logo_sample_path.partition("/0/")
+        _logo_url_prefix = base_url + logo_prefix_raw + "/"
+        _logo_url_suffix = "/" + logo_suffix_raw
+
         for channel in channels:
             num += 1
             # Use negative channel_id as series_id to distinguish from provider series
@@ -1793,7 +1800,7 @@ def xc_get_series(request, user, category_id=None):
             logo = channel.logo
             cover = None
             if logo:
-                cover = f"{_logo_url_parts[0]}{logo.id}{_logo_url_parts[1]}"
+                cover = f"{_logo_url_prefix}{logo.id}{_logo_url_suffix}"
 
             group_name = channel.channel_group.name if channel.channel_group else "DVR"
 
