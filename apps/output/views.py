@@ -1667,6 +1667,7 @@ def xc_get_series_categories(user):
         return []
 
     from apps.vod.models import VODCategory, M3USeriesRelation
+    from apps.channels.dvr_access import is_dvr_view_enabled
 
     response = []
 
@@ -1683,6 +1684,14 @@ def xc_get_series_categories(user):
             "parent_id": 0,
         })
 
+    # Add DVR Recordings category if user has DVR view permission
+    if is_dvr_view_enabled(user=user):
+        response.append({
+            "category_id": "dvr",
+            "category_name": "DVR Recordings",
+            "parent_id": 0,
+        })
+
     return response
 
 
@@ -1692,69 +1701,124 @@ def xc_get_series(request, user, category_id=None):
         return []
 
     from apps.vod.models import M3USeriesRelation
-
-    rel_filters = {"m3u_account__is_active": True}
-    if category_id:
-        rel_filters["category_id"] = category_id
-
-    relations = _xc_fetch_priority_distinct_relations(
-        manager=M3USeriesRelation.objects,
-        rel_filters=rel_filters,
-        distinct_field='series_id',
-        value_fields=XC_SERIES_VALUE_FIELDS,
-        order_by_name_field='series__name',
-    )
+    from apps.channels.dvr_access import is_dvr_view_enabled, recordings_queryset_for_user
+    from apps.channels.models import Channel, ChannelProfile
 
     _logo_url_parts = _xc_vodlogo_url_parts(request)
-    # One reverse for all series backdrop rewrites.
     _series_image_parts = vod_image_url_parts(request, "series")
 
     series_list = []
     append = series_list.append
-    for num, row in enumerate(relations, 1):
-        custom_props = row['series__custom_properties'] or {}
-        category_id = row['category_id']
-        rating = row['series__rating']
-        year_str = str(row['series__year']) if row['series__year'] else ""
-        release_date = custom_props.get('release_date', year_str)
-        artwork = _xc_relation_artwork_from_row(row, custom_props)
+    num = 0
 
-        append({
-            "num": num,
-            "name": row['series__name'],
-            "series_id": row['id'],
-            "cover": _xc_cover_or_logo(
-                request,
-                'series',
-                row['series__id'],
-                artwork['movie_image'],
-                logo_id=row['series__logo_id'],
-                logo_url_parts=_logo_url_parts,
-                url_parts=_series_image_parts,
-            ),
-            "plot": row['series__description'] or "",
-            "cast": custom_props.get('cast', ''),
-            "director": custom_props.get('director', ''),
-            "genre": row['series__genre'] or "",
-            "release_date": release_date,
-            "releaseDate": release_date,
-            "last_modified": str(int(row['updated_at'].timestamp())),
-            "rating": str(rating or "0"),
-            "rating_5based": str(round(float(rating or 0) / 2, 2)) if rating else "0",
-            "backdrop_path": rewrite_backdrop_paths(
-                request,
-                'series',
-                row['series__id'],
-                artwork['backdrop_path'],
-                url_parts=_series_image_parts,
-            ),
-            "youtube_trailer": custom_props.get('youtube_trailer', ''),
-            "episode_run_time": custom_props.get('episode_run_time', ''),
-            "category_id": str(category_id) if category_id else "0",
-            "category_ids": [category_id] if category_id else [],
-            "tmdb_id": row['series__tmdb_id'] or "",
-            "imdb_id": row['series__imdb_id'] or "",
-        })
+    # Provider series (existing logic)
+    if category_id != "dvr":
+        rel_filters = {"m3u_account__is_active": True}
+        if category_id:
+            rel_filters["category_id"] = category_id
+
+        relations = _xc_fetch_priority_distinct_relations(
+            manager=M3USeriesRelation.objects,
+            rel_filters=rel_filters,
+            distinct_field='series_id',
+            value_fields=XC_SERIES_VALUE_FIELDS,
+            order_by_name_field='series__name',
+        )
+
+        for row in relations:
+            num += 1
+            custom_props = row['series__custom_properties'] or {}
+            cat_id = row['category_id']
+            rating = row['series__rating']
+            year_str = str(row['series__year']) if row['series__year'] else ""
+            release_date = custom_props.get('release_date', year_str)
+            artwork = _xc_relation_artwork_from_row(row, custom_props)
+
+            append({
+                "num": num,
+                "name": row['series__name'],
+                "series_id": row['id'],
+                "cover": _xc_cover_or_logo(
+                    request,
+                    'series',
+                    row['series__id'],
+                    artwork['movie_image'],
+                    logo_id=row['series__logo_id'],
+                    logo_url_parts=_logo_url_parts,
+                    url_parts=_series_image_parts,
+                ),
+                "plot": row['series__description'] or "",
+                "cast": custom_props.get('cast', ''),
+                "director": custom_props.get('director', ''),
+                "genre": row['series__genre'] or "",
+                "release_date": release_date,
+                "releaseDate": release_date,
+                "last_modified": str(int(row['updated_at'].timestamp())),
+                "rating": str(rating or "0"),
+                "rating_5based": str(round(float(rating or 0) / 2, 2)) if rating else "0",
+                "backdrop_path": rewrite_backdrop_paths(
+                    request,
+                    'series',
+                    row['series__id'],
+                    artwork['backdrop_path'],
+                    url_parts=_series_image_parts,
+                ),
+                "youtube_trailer": custom_props.get('youtube_trailer', ''),
+                "episode_run_time": custom_props.get('episode_run_time', ''),
+                "category_id": str(cat_id) if cat_id else "0",
+                "category_ids": [cat_id] if cat_id else [],
+                "tmdb_id": row['series__tmdb_id'] or "",
+                "imdb_id": row['series__imdb_id'] or "",
+            })
+
+    # DVR series (channels with recordings) - only for "dvr" category
+    if category_id in (None, "dvr") and is_dvr_view_enabled(user=user):
+        # Get channels that have recordings accessible to this user
+        recordings_qs = recordings_queryset_for_user(
+            Recording.objects.filter(
+                Q(custom_properties__has_key="_hls_dir") |
+                Q(custom_properties__has_key="file_path")
+            ), user
+        ).select_related("channel", "channel__logo", "channel__channel_group")
+
+        # Group by channel
+        channel_ids = recordings_qs.values_list('channel_id', flat=True).distinct()
+        channels = Channel.objects.filter(id__in=channel_ids).select_related('logo', 'channel_group')
+
+        for channel in channels:
+            num += 1
+            # Use negative channel_id as series_id to distinguish from provider series
+            dvr_series_id = -channel.id
+
+            logo = channel.logo
+            cover = None
+            if logo:
+                cover = f"{_logo_url_parts[0]}{logo.id}{_logo_url_parts[1]}"
+
+            group_name = channel.channel_group.name if channel.channel_group else "DVR"
+
+            append({
+                "num": num,
+                "name": channel.name,
+                "series_id": dvr_series_id,  # Negative ID for DVR series
+                "cover": cover,
+                "plot": f"DVR recordings from {channel.name}",
+                "cast": "",
+                "director": "",
+                "genre": group_name,
+                "release_date": "",
+                "releaseDate": "",
+                "last_modified": str(int(time.time())),
+                "rating": "0",
+                "rating_5based": "0",
+                "backdrop_path": [],
+                "youtube_trailer": "",
+                "episode_run_time": "",
+                "category_id": "dvr",
+                "category_ids": ["dvr"],
+                "tmdb_id": "",
+                "imdb_id": "",
+            })
 
     return series_list
 
@@ -1765,12 +1829,149 @@ def xc_get_series_info(request, user, series_id):
         raise Http404()
 
     from apps.vod.models import M3USeriesRelation, M3UEpisodeRelation
+    from apps.channels.dvr_access import is_dvr_view_enabled, recordings_queryset_for_user
+    from apps.channels.models import Recording, Channel
 
     if not series_id:
         raise Http404()
 
-    # Users with VOD access get series from all active M3U accounts
-    filters = {"id": series_id, "m3u_account__is_active": True}
+    # Check if this is a DVR series (negative series_id = -channel_id)
+    try:
+        series_id_int = int(series_id)
+    except (ValueError, TypeError):
+        raise Http404()
+
+    if series_id_int < 0:
+        # DVR series: series_id = -channel_id
+        channel_id = -series_id_int
+        if not is_dvr_view_enabled(user=user):
+            raise Http404()
+
+        try:
+            channel = Channel.objects.select_related('logo', 'channel_group').get(id=channel_id)
+        except Channel.DoesNotExist:
+            raise Http404()
+
+        # Get recordings for this channel accessible to user
+        recordings = recordings_queryset_for_user(
+            Recording.objects.filter(
+                channel_id=channel_id,
+                custom_properties__has_key="_hls_dir"
+            ) | Recording.objects.filter(
+                channel_id=channel_id,
+                custom_properties__has_key="file_path"
+            ), user
+        ).select_related("channel").order_by("-start_time")
+
+        # Build episodes from recordings
+        seasons = {}
+        base_url = build_absolute_uri_with_port(request, "")
+
+        for rec in recordings:
+            cp = rec.custom_properties or {}
+            program = cp.get("program", {})
+
+            # Use recording date as season/episode
+            # Season = year, Episode = day of year (or just use sequential numbering)
+            season_num = rec.start_time.year
+            episode_num = len([r for r in recordings if r.start_time.year == season_num and r.start_time <= rec.start_time])
+
+            if season_num not in seasons:
+                seasons[season_num] = []
+
+            # Generate playback URL with token
+            hls_dir = cp.get("_hls_dir")
+            file_path = cp.get("file_path")
+            if hls_dir:
+                playback_url = f"{base_url}/api/channels/recordings/{rec.id}/hls/index.m3u8"
+            elif file_path:
+                playback_url = f"{base_url}/api/channels/recordings/{rec.id}/file/"
+            else:
+                continue
+
+            token = _generate_dvr_playlist_token(rec.id)
+            playback_url = f"{playback_url}?token={token}"
+
+            title = program.get("title", channel.name)
+            description = program.get("description", "")
+            start_str = rec.start_time.strftime("%Y-%m-%d %H:%M:%S")
+            duration_secs = int((rec.end_time - rec.start_time).total_seconds())
+
+            logo = channel.logo
+            cover = None
+            if logo:
+                cover = f"{base_url}/api/channels/logo/{logo.id}/"
+
+            seasons[season_num].append({
+                "id": -rec.id,  # Negative ID for DVR episodes
+                "season": season_num,
+                "episode_num": episode_num,
+                "title": title,
+                "container_extension": "mp4",
+                "added": str(int(rec.created_at.timestamp())),
+                "custom_sid": None,
+                "direct_source": playback_url,  # Direct playback URL with token
+                "info": {
+                    "id": -rec.id,
+                    "name": title,
+                    "overview": description,
+                    "crew": "",
+                    "directed_by": "",
+                    "imdb_id": "",
+                    "air_date": start_str,
+                    "backdrop_path": [],
+                    "movie_image": cover,
+                    "rating": 0.0,
+                    "release_date": start_str,
+                    "duration_secs": duration_secs,
+                    "duration": format_duration_hms(duration_secs),
+                    "video": {},
+                    "audio": {},
+                    "bitrate": 0,
+                }
+            })
+
+        seasons_list = [
+            {"season_number": int(season_num), "name": f"Season {season_num}"}
+            for season_num in sorted(seasons.keys(), key=lambda x: int(x), reverse=True)
+        ]
+
+        logo = channel.logo
+        series_cover = None
+        if logo:
+            series_cover = f"{base_url}/api/channels/logo/{logo.id}/"
+
+        group_name = channel.channel_group.name if channel.channel_group else "DVR"
+
+        info = {
+            'seasons': seasons_list,
+            "info": {
+                "name": channel.name,
+                "cover": series_cover,
+                "plot": f"DVR recordings from {channel.name}",
+                "cast": "",
+                "director": "",
+                "genre": group_name,
+                "release_date": "",
+                "releaseDate": "",
+                "added": str(int(time.time())),
+                "last_modified": str(int(time.time())),
+                "rating": "0",
+                "rating_5based": "0",
+                "backdrop_path": [],
+                "youtube_trailer": "",
+                "imdb": "",
+                "tmdb": "",
+                "episode_run_time": "",
+                "category_id": "dvr",
+                "category_ids": ["dvr"],
+            },
+            "episodes": dict(seasons)
+        }
+        return info
+
+    # Provider series (existing logic)
+    filters = {"id": series_id_int, "m3u_account__is_active": True}
 
     try:
         series_relation = M3USeriesRelation.objects.select_related('series', 'series__logo').get(**filters)
