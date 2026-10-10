@@ -1667,7 +1667,10 @@ def xc_get_series_categories(user):
         return []
 
     from apps.vod.models import VODCategory, M3USeriesRelation
-    from apps.channels.dvr_access import is_dvr_view_enabled
+    from apps.channels.dvr_access import is_dvr_view_enabled, recordings_queryset_for_user
+    from apps.channels.models import Recording
+    from django.db.models import Q
+    from django.utils import timezone as django_timezone
 
     response = []
 
@@ -1684,13 +1687,41 @@ def xc_get_series_categories(user):
             "parent_id": 0,
         })
 
-    # Add DVR Recordings category if user has DVR view permission
+    # Add DVR categories if user has DVR view permission
     if is_dvr_view_enabled(user=user):
-        response.append({
-            "category_id": "dvr",
-            "category_name": "DVR Recordings",
-            "parent_id": 0,
-        })
+        # Get all accessible recordings
+        recordings = recordings_queryset_for_user(
+            Recording.objects.filter(
+                Q(custom_properties__has_key="_hls_dir") |
+                Q(custom_properties__has_key="file_path")
+            ), user
+        ).select_related("channel")
+
+        # Check for in-progress recordings
+        has_in_progress = recordings.filter(custom_properties__has_key="_hls_dir").exists()
+        if has_in_progress:
+            response.append({
+                "category_id": "dvr_in_progress",
+                "category_name": "In Progress",
+                "parent_id": 0,
+            })
+
+        # Get unique dates for completed recordings
+        completed_recordings = recordings.filter(custom_properties__has_key="file_path")
+        if completed_recordings.exists():
+            dates = set()
+            for rec in completed_recordings.only('start_time'):
+                if rec.start_time:
+                    date_str = rec.start_time.strftime("%d-%b-%Y").upper()
+                    dates.add(date_str)
+
+            # Sort dates descending (newest first)
+            for date_str in sorted(dates, reverse=True):
+                response.append({
+                    "category_id": f"dvr_date_{date_str}",
+                    "category_name": date_str,
+                    "parent_id": 0,
+                })
 
     return response
 
@@ -1771,8 +1802,12 @@ def xc_get_series(request, user, category_id=None):
                 "imdb_id": row['series__imdb_id'] or "",
             })
 
-    # DVR series (channels with recordings) - only for "dvr" category
-    if category_id in (None, "dvr") and is_dvr_view_enabled(user=user):
+    # DVR series (channels with recordings) - handle "dvr", "dvr_in_progress", and date categories
+    if (category_id is None or category_id == "dvr" or category_id == "dvr_in_progress" or category_id.startswith("dvr_date_")) and is_dvr_view_enabled(user=user):
+        from apps.channels.models import Recording
+        from django.db.models import Q
+        from django.utils import timezone as django_timezone
+
         # Get channels that have recordings accessible to this user
         recordings_qs = recordings_queryset_for_user(
             Recording.objects.filter(
@@ -1781,20 +1816,48 @@ def xc_get_series(request, user, category_id=None):
             ), user
         ).select_related("channel", "channel__logo", "channel__channel_group")
 
+        # Filter recordings based on category
+        if category_id == "dvr_in_progress":
+            # Only channels with in-progress recordings
+            recordings_qs = recordings_qs.filter(custom_properties__has_key="_hls_dir")
+        elif category_id and category_id.startswith("dvr_date_"):
+            # Only channels with completed recordings on this date
+            date_str = category_id.replace("dvr_date_", "")
+            try:
+                target_date = django_timezone.datetime.strptime(date_str, "%d-%b-%Y").date()
+                # Filter recordings where start_time matches the date
+                recording_ids = []
+                for rec in recordings_qs.filter(custom_properties__has_key="file_path"):
+                    if rec.start_time and rec.start_time.date() == target_date:
+                        recording_ids.append(rec.id)
+                recordings_qs = recordings_qs.filter(id__in=recording_ids)
+            except ValueError:
+                recordings_qs = recordings_qs.none()
+
         # Group by channel
         channel_ids = recordings_qs.values_list('channel_id', flat=True).distinct()
         channels = Channel.objects.filter(id__in=channel_ids).select_related('logo', 'channel_group')
 
-        # Precompute channel logo URL parts (uses /api/channels/logo/, not VOD logo)
+        # Precompute channel logo URL parts
         base_url = build_absolute_uri_with_port(request, "")
         logo_sample_path = reverse("api:channels:logo-cache", args=[0])
         logo_prefix_raw, _, logo_suffix_raw = logo_sample_path.partition("/0/")
         _logo_url_prefix = base_url + logo_prefix_raw + "/"
         _logo_url_suffix = "/" + logo_suffix_raw
 
+        # Determine category_id for each series
+        if category_id == "dvr_in_progress":
+            cat_id = "dvr_in_progress"
+            cat_name = "In Progress"
+        elif category_id and category_id.startswith("dvr_date_"):
+            cat_id = category_id
+            cat_name = category_id.replace("dvr_date_", "")
+        else:
+            cat_id = "dvr"
+            cat_name = "DVR Recordings"
+
         for channel in channels:
             num += 1
-            # Use negative channel_id as series_id to distinguish from provider series
             dvr_series_id = -channel.id
 
             logo = channel.logo
@@ -1807,7 +1870,7 @@ def xc_get_series(request, user, category_id=None):
             append({
                 "num": num,
                 "name": channel.name,
-                "series_id": dvr_series_id,  # Negative ID for DVR series
+                "series_id": dvr_series_id,
                 "cover": cover,
                 "plot": f"DVR recordings from {channel.name}",
                 "cast": "",
@@ -1821,8 +1884,8 @@ def xc_get_series(request, user, category_id=None):
                 "backdrop_path": [],
                 "youtube_trailer": "",
                 "episode_run_time": "",
-                "category_id": "dvr",
-                "category_ids": ["dvr"],
+                "category_id": cat_id,
+                "category_ids": [cat_id],
                 "tmdb_id": "",
                 "imdb_id": "",
             })
