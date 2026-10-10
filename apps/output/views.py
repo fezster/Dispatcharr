@@ -1699,7 +1699,7 @@ def xc_get_series_categories(user):
         has_in_progress = in_progress_qs.filter(custom_properties__has_key="_hls_dir").exists()
         if has_in_progress:
             response.append({
-                "category_id": "dvr_in_progress",
+                "category_id": "-1",  # Numeric ID for TiviMate compatibility
                 "category_name": "In Progress",
                 "parent_id": 0,
             })
@@ -1717,8 +1717,14 @@ def xc_get_series_categories(user):
 
         # Sort dates descending (newest first)
         for date_str in sorted(dates, reverse=True):
+            # Convert date to numeric ID: -YYYYMMDD
+            try:
+                dt = django_timezone.datetime.strptime(date_str, "%d-%b-%Y")
+                date_id = f"-{dt.year}{dt.month:02d}{dt.day:02d}"
+            except ValueError:
+                date_id = f"-{abs(hash(date_str)) % 100000000}"
             response.append({
-                "category_id": f"dvr_date_{date_str}",
+                "category_id": date_id,
                 "category_name": date_str,
                 "parent_id": 0,
             })
@@ -1743,7 +1749,8 @@ def xc_get_series(request, user, category_id=None):
     num = 0
 
     # Provider series (existing logic) - skip for all DVR categories
-    is_dvr_category = category_id in ("dvr", "dvr_in_progress") or (category_id and category_id.startswith("dvr_date_"))
+    # DVR categories now use numeric IDs: -1 (In Progress), -YYYYMMDD (date)
+    is_dvr_category = category_id in ("dvr", "-1") or (category_id and category_id.startswith("-") and category_id[1:].isdigit())
     if not is_dvr_category:
         rel_filters = {"m3u_account__is_active": True}
         if category_id:
@@ -1803,8 +1810,10 @@ def xc_get_series(request, user, category_id=None):
                 "imdb_id": row['series__imdb_id'] or "",
             })
 
-    # DVR series (channels with recordings) - handle "dvr", "dvr_in_progress", and date categories
-    if (category_id is None or category_id == "dvr" or category_id == "dvr_in_progress" or category_id.startswith("dvr_date_")) and is_dvr_view_enabled(user=user):
+    # DVR series (channels with recordings) - handle "dvr", "-1" (In Progress), "-YYYYMMDD" (date)
+    # category_id can be: None, "dvr", "-1", "-YYYYMMDD"
+    is_dvr_cat = category_id in (None, "dvr", "-1") or (category_id and category_id.startswith("-") and category_id[1:].isdigit())
+    if is_dvr_cat and is_dvr_view_enabled(user=user):
         from apps.channels.models import Recording, Channel
         from django.db.models import Q
         from django.utils import timezone as django_timezone
@@ -1818,21 +1827,27 @@ def xc_get_series(request, user, category_id=None):
         ).select_related("channel", "channel__logo", "channel__channel_group")
 
         # Filter recordings based on category
-        if category_id == "dvr_in_progress":
+        if category_id == "-1":
             # Only channels with in-progress recordings
             recordings_qs = recordings_qs.filter(custom_properties__has_key="_hls_dir")
-        elif category_id and category_id.startswith("dvr_date_"):
-            # Only channels with completed recordings on this date
-            date_str = category_id.replace("dvr_date_", "")
-            try:
-                target_date = django_timezone.datetime.strptime(date_str, "%d-%b-%Y").date()
-                # Filter recordings where start_time matches the date
-                recording_ids = []
-                for rec in recordings_qs.filter(custom_properties__has_key="file_path"):
-                    if rec.start_time and rec.start_time.date() == target_date:
-                        recording_ids.append(rec.id)
-                recordings_qs = recordings_qs.filter(id__in=recording_ids)
-            except ValueError:
+        elif category_id and category_id.startswith("-") and category_id != "-1":
+            # Date category: -YYYYMMDD
+            date_num = category_id[1:]  # Remove leading dash
+            if len(date_num) == 8 and date_num.isdigit():
+                try:
+                    year = int(date_num[:4])
+                    month = int(date_num[4:6])
+                    day = int(date_num[6:8])
+                    target_date = django_timezone.datetime(year, month, day).date()
+                    # Filter recordings where start_time matches the date
+                    recording_ids = []
+                    for rec in recordings_qs.filter(custom_properties__has_key="file_path"):
+                        if rec.start_time and rec.start_time.date() == target_date:
+                            recording_ids.append(rec.id)
+                    recordings_qs = recordings_qs.filter(id__in=recording_ids)
+                except (ValueError, IndexError):
+                    recordings_qs = recordings_qs.none()
+            else:
                 recordings_qs = recordings_qs.none()
 
         # Group by channel
@@ -1853,13 +1868,13 @@ def xc_get_series(request, user, category_id=None):
             num += 1
             dvr_series_id = -channel.id
 
-            # Determine category for this specific channel
+            # Determine category for this specific channel (numeric IDs)
             if category_id is None:
                 # Check this channel's recordings to assign correct category
                 channel_recordings = recordings_qs.filter(channel_id=channel.id)
                 has_in_progress = channel_recordings.filter(custom_properties__has_key="_hls_dir").exists()
                 if has_in_progress:
-                    cat_id = "dvr_in_progress"
+                    cat_id = "-1"
                 else:
                     # Get the most recent completed recording date for this channel
                     completed_rec = channel_recordings.filter(
@@ -1867,16 +1882,16 @@ def xc_get_series(request, user, category_id=None):
                         start_time__isnull=False
                     ).order_by('-start_time').first()
                     if completed_rec and completed_rec.start_time:
-                        date_str = completed_rec.start_time.strftime("%d-%b-%Y").upper()
-                        cat_id = f"dvr_date_{date_str}"
+                        dt = completed_rec.start_time
+                        cat_id = f"-{dt.year}{dt.month:02d}{dt.day:02d}"
                     else:
-                        cat_id = "dvr"
-            elif category_id == "dvr_in_progress":
-                cat_id = "dvr_in_progress"
-            elif category_id and category_id.startswith("dvr_date_"):
+                        cat_id = "-999"  # Generic DVR fallback
+            elif category_id == "-1":
+                cat_id = "-1"
+            elif category_id and category_id.startswith("-") and category_id != "-1":
                 cat_id = category_id
             else:
-                cat_id = "dvr"
+                cat_id = "-999"
 
             logo = channel.logo
             cover = None
@@ -2037,10 +2052,10 @@ def xc_get_series_info(request, user, series_id):
 
         group_name = channel.channel_group.name if channel.channel_group else "DVR"
 
-        # Determine category for this series based on its recordings
+        # Determine category for this series based on its recordings (numeric IDs)
         has_in_progress = recordings.filter(custom_properties__has_key="_hls_dir").exists()
         if has_in_progress:
-            cat_id = "dvr_in_progress"
+            cat_id = "-1"
         else:
             # Get the most recent completed recording date
             completed_rec = recordings.filter(
@@ -2048,10 +2063,10 @@ def xc_get_series_info(request, user, series_id):
                 start_time__isnull=False
             ).order_by('-start_time').first()
             if completed_rec and completed_rec.start_time:
-                date_str = completed_rec.start_time.strftime("%d-%b-%Y").upper()
-                cat_id = f"dvr_date_{date_str}"
+                dt = completed_rec.start_time
+                cat_id = f"-{dt.year}{dt.month:02d}{dt.day:02d}"
             else:
-                cat_id = "dvr"
+                cat_id = "-999"
 
         info = {
             'seasons': seasons_list,
