@@ -1828,7 +1828,7 @@ def xc_get_series(request, user, category_id=None):
 
         # Filter recordings based on category
         if category_id == "-1":
-            # Only channels with in-progress recordings
+            # Only in-progress recordings
             recordings_qs = recordings_qs.filter(custom_properties__has_key="_hls_dir")
         elif category_id and category_id.startswith("-") and category_id != "-1":
             # Date category: -YYYYMMDD
@@ -1861,38 +1861,13 @@ def xc_get_series(request, user, category_id=None):
         _logo_url_prefix = base_url + logo_prefix_raw + "/"
         _logo_url_suffix = "/" + logo_suffix_raw
 
-        # For each channel, determine the appropriate category based on its recordings
-        # When category_id is None (get all), assign per-channel category
-        # When specific category is requested, use that category for all
+        # For each channel, create separate series for in-progress and completed recordings
+        # when getting all series (category_id=None). When specific category requested,
+        # only create series for that category.
         for channel in channels:
-            num += 1
-            dvr_series_id = -channel.id
-
-            # Determine category for this specific channel (numeric IDs)
-            if category_id is None:
-                # Check this channel's recordings to assign correct category
-                channel_recordings = recordings_qs.filter(channel_id=channel.id)
-                # First, check for completed recordings (most recent completed determines date category)
-                completed_rec = channel_recordings.filter(
-                    custom_properties__has_key="file_path",
-                    start_time__isnull=False
-                ).order_by('-start_time').first()
-                if completed_rec and completed_rec.start_time:
-                    dt = completed_rec.start_time
-                    cat_id = f"-{dt.year}{dt.month:02d}{dt.day:02d}"
-                else:
-                    # No completed recordings - check for in-progress
-                    has_in_progress = channel_recordings.filter(custom_properties__has_key="_hls_dir").exists()
-                    if has_in_progress:
-                        cat_id = "-1"
-                    else:
-                        cat_id = "-999"  # Generic DVR fallback
-            elif category_id == "-1":
-                cat_id = "-1"
-            elif category_id and category_id.startswith("-") and category_id != "-1":
-                cat_id = category_id
-            else:
-                cat_id = "-999"
+            channel_recordings = recordings_qs.filter(channel_id=channel.id)
+            has_in_progress = channel_recordings.filter(custom_properties__has_key="_hls_dir").exists()
+            has_completed = channel_recordings.filter(custom_properties__has_key="file_path", start_time__isnull=False).exists()
 
             logo = channel.logo
             cover = None
@@ -1901,28 +1876,138 @@ def xc_get_series(request, user, category_id=None):
 
             group_name = channel.channel_group.name if channel.channel_group else "DVR"
 
-            append({
-                "num": num,
-                "name": channel.name,
-                "series_id": dvr_series_id,
-                "cover": cover,
-                "plot": f"DVR recordings from {channel.name}",
-                "cast": "",
-                "director": "",
-                "genre": group_name,
-                "release_date": "",
-                "releaseDate": "",
-                "last_modified": str(int(time.time())),
-                "rating": "0",
-                "rating_5based": "0",
-                "backdrop_path": [],
-                "youtube_trailer": "",
-                "episode_run_time": "",
-                "category_id": cat_id,
-                "category_ids": [cat_id],
-                "tmdb_id": "",
-                "imdb_id": "",
-            })
+            if category_id is None:
+                # Get all series - create separate entries for in-progress and completed
+                if has_in_progress:
+                    num += 1
+                    # In Progress series: use unique series_id (offset by -1000000)
+                    in_progress_series_id = -channel.id - 1000000
+                    append({
+                        "num": num,
+                        "name": f"{channel.name} (In Progress)",
+                        "series_id": in_progress_series_id,
+                        "cover": cover,
+                        "plot": f"In-progress DVR recordings from {channel.name}",
+                        "cast": "",
+                        "director": "",
+                        "genre": group_name,
+                        "release_date": "",
+                        "releaseDate": "",
+                        "last_modified": str(int(time.time())),
+                        "rating": "0",
+                        "rating_5based": "0",
+                        "backdrop_path": [],
+                        "youtube_trailer": "",
+                        "episode_run_time": "",
+                        "category_id": "-1",
+                        "category_ids": ["-1"],
+                        "tmdb_id": "",
+                        "imdb_id": "",
+                    })
+
+                if has_completed:
+                    num += 1
+                    # Completed recordings series: use original series_id
+                    completed_series_id = -channel.id
+                    # Determine date category from most recent completed recording
+                    completed_rec = channel_recordings.filter(
+                        custom_properties__has_key="file_path",
+                        start_time__isnull=False
+                    ).order_by('-start_time').first()
+                    if completed_rec and completed_rec.start_time:
+                        dt = completed_rec.start_time
+                        cat_id = f"-{dt.year}{dt.month:02d}{dt.day:02d}"
+                    else:
+                        cat_id = "-999"
+
+                    append({
+                        "num": num,
+                        "name": channel.name,
+                        "series_id": completed_series_id,
+                        "cover": cover,
+                        "plot": f"DVR recordings from {channel.name}",
+                        "cast": "",
+                        "director": "",
+                        "genre": group_name,
+                        "release_date": "",
+                        "releaseDate": "",
+                        "last_modified": str(int(time.time())),
+                        "rating": "0",
+                        "rating_5based": "0",
+                        "backdrop_path": [],
+                        "youtube_trailer": "",
+                        "episode_run_time": "",
+                        "category_id": cat_id,
+                        "category_ids": [cat_id],
+                        "tmdb_id": "",
+                        "imdb_id": "",
+                    })
+            elif category_id == "-1":
+                # Only in-progress category requested
+                if has_in_progress:
+                    num += 1
+                    in_progress_series_id = -channel.id - 1000000
+                    append({
+                        "num": num,
+                        "name": f"{channel.name} (In Progress)",
+                        "series_id": in_progress_series_id,
+                        "cover": cover,
+                        "plot": f"In-progress DVR recordings from {channel.name}",
+                        "cast": "",
+                        "director": "",
+                        "genre": group_name,
+                        "release_date": "",
+                        "releaseDate": "",
+                        "last_modified": str(int(time.time())),
+                        "rating": "0",
+                        "rating_5based": "0",
+                        "backdrop_path": [],
+                        "youtube_trailer": "",
+                        "episode_run_time": "",
+                        "category_id": "-1",
+                        "category_ids": ["-1"],
+                        "tmdb_id": "",
+                        "imdb_id": "",
+                    })
+            elif category_id and category_id.startswith("-") and category_id != "-1":
+                # Specific date category requested
+                if has_completed:
+                    # Check if this channel has recordings for this date
+                    date_num = category_id[1:]
+                    if len(date_num) == 8 and date_num.isdigit():
+                        year = int(date_num[:4])
+                        month = int(date_num[4:6])
+                        day = int(date_num[6:8])
+                        target_date = django_timezone.datetime(year, month, day).date()
+                        date_recordings = channel_recordings.filter(
+                            custom_properties__has_key="file_path",
+                            start_time__date=target_date
+                        )
+                        if date_recordings.exists():
+                            num += 1
+                            completed_series_id = -channel.id
+                            append({
+                                "num": num,
+                                "name": channel.name,
+                                "series_id": completed_series_id,
+                                "cover": cover,
+                                "plot": f"DVR recordings from {channel.name}",
+                                "cast": "",
+                                "director": "",
+                                "genre": group_name,
+                                "release_date": "",
+                                "releaseDate": "",
+                                "last_modified": str(int(time.time())),
+                                "rating": "0",
+                                "rating_5based": "0",
+                                "backdrop_path": [],
+                                "youtube_trailer": "",
+                                "episode_run_time": "",
+                                "category_id": category_id,
+                                "category_ids": [category_id],
+                                "tmdb_id": "",
+                                "imdb_id": "",
+                            })
 
     return series_list
 
@@ -1946,10 +2031,18 @@ def xc_get_series_info(request, user, series_id):
         raise Http404()
 
     if series_id_int < 0:
-        # DVR series: series_id = -channel_id
-        channel_id = -series_id_int
+        # DVR series:
+        # - Completed recordings: series_id = -channel_id (e.g., -4)
+        # - In Progress recordings: series_id = -channel_id - 1000000 (e.g., -1000004)
         if not is_dvr_view_enabled(user=user):
             raise Http404()
+
+        # Check if this is an In Progress series (series_id < -1000000)
+        is_in_progress_series = series_id_int < -1000000
+        if is_in_progress_series:
+            channel_id = -(series_id_int + 1000000)  # Extract channel_id
+        else:
+            channel_id = -series_id_int
 
         try:
             channel = Channel.objects.select_related('logo', 'channel_group').get(id=channel_id)
@@ -1957,15 +2050,22 @@ def xc_get_series_info(request, user, series_id):
             raise Http404()
 
         # Get recordings for this channel accessible to user
-        recordings = recordings_queryset_for_user(
-            Recording.objects.filter(
-                channel_id=channel_id,
-                custom_properties__has_key="_hls_dir"
-            ) | Recording.objects.filter(
-                channel_id=channel_id,
-                custom_properties__has_key="file_path"
-            ), user
-        ).select_related("channel").order_by("-start_time")
+        if is_in_progress_series:
+            # Only in-progress recordings for In Progress series
+            recordings = recordings_queryset_for_user(
+                Recording.objects.filter(
+                    channel_id=channel_id,
+                    custom_properties__has_key="_hls_dir"
+                ), user
+            ).select_related("channel").order_by("-start_time")
+        else:
+            # Only completed recordings for date series
+            recordings = recordings_queryset_for_user(
+                Recording.objects.filter(
+                    channel_id=channel_id,
+                    custom_properties__has_key="file_path"
+                ), user
+            ).select_related("channel").order_by("-start_time")
 
         # Build episodes from recordings
         seasons = {}
@@ -2053,29 +2153,32 @@ def xc_get_series_info(request, user, series_id):
 
         group_name = channel.channel_group.name if channel.channel_group else "DVR"
 
-        # Determine category for this series based on its recordings (numeric IDs)
-        # Prioritize completed recordings; only "In Progress" if no completed recordings
-        completed_rec = recordings.filter(
-            custom_properties__has_key="file_path",
-            start_time__isnull=False
-        ).order_by('-start_time').first()
-        if completed_rec and completed_rec.start_time:
-            dt = completed_rec.start_time
-            cat_id = f"-{dt.year}{dt.month:02d}{dt.day:02d}"
+        # Determine category for this series based on series type
+        if is_in_progress_series:
+            # In Progress series always has category -1
+            cat_id = "-1"
+            series_name = f"{channel.name} (In Progress)"
+            series_plot = f"In-progress DVR recordings from {channel.name}"
         else:
-            # No completed recordings - check for in-progress
-            has_in_progress = recordings.filter(custom_properties__has_key="_hls_dir").exists()
-            if has_in_progress:
-                cat_id = "-1"
+            # Completed series gets date category from most recent recording
+            completed_rec = recordings.filter(
+                custom_properties__has_key="file_path",
+                start_time__isnull=False
+            ).order_by('-start_time').first()
+            if completed_rec and completed_rec.start_time:
+                dt = completed_rec.start_time
+                cat_id = f"-{dt.year}{dt.month:02d}{dt.day:02d}"
             else:
                 cat_id = "-999"
+            series_name = channel.name
+            series_plot = f"DVR recordings from {channel.name}"
 
         info = {
             'seasons': seasons_list,
             "info": {
-                "name": channel.name,
+                "name": series_name,
                 "cover": series_cover,
-                "plot": f"DVR recordings from {channel.name}",
+                "plot": series_plot,
                 "cast": "",
                 "director": "",
                 "genre": group_name,
