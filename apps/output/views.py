@@ -1689,16 +1689,14 @@ def xc_get_series_categories(user):
 
     # Add DVR categories if user has DVR view permission
     if is_dvr_view_enabled(user=user):
-        # Get all accessible recordings
-        recordings = recordings_queryset_for_user(
+        # Check for in-progress recordings (doesn't need channel)
+        in_progress_qs = recordings_queryset_for_user(
             Recording.objects.filter(
                 Q(custom_properties__has_key="_hls_dir") |
                 Q(custom_properties__has_key="file_path")
             ), user
-        ).select_related("channel")
-
-        # Check for in-progress recordings
-        has_in_progress = recordings.filter(custom_properties__has_key="_hls_dir").exists()
+        )
+        has_in_progress = in_progress_qs.filter(custom_properties__has_key="_hls_dir").exists()
         if has_in_progress:
             response.append({
                 "category_id": "dvr_in_progress",
@@ -1706,22 +1704,24 @@ def xc_get_series_categories(user):
                 "parent_id": 0,
             })
 
-        # Get unique dates for completed recordings
-        completed_recordings = recordings.filter(custom_properties__has_key="file_path")
-        if completed_recordings.exists():
-            dates = set()
-            for rec in completed_recordings.only('start_time'):
-                if rec.start_time:
-                    date_str = rec.start_time.strftime("%d-%b-%Y").upper()
-                    dates.add(date_str)
+        # Get unique dates for completed recordings (use values_list to avoid select_related conflict)
+        completed_dates = in_progress_qs.filter(
+            custom_properties__has_key="file_path"
+        ).exclude(start_time__isnull=True).values_list('start_time', flat=True)
 
-            # Sort dates descending (newest first)
-            for date_str in sorted(dates, reverse=True):
-                response.append({
-                    "category_id": f"dvr_date_{date_str}",
-                    "category_name": date_str,
-                    "parent_id": 0,
-                })
+        dates = set()
+        for start_time in completed_dates:
+            if start_time:
+                date_str = start_time.strftime("%d-%b-%Y").upper()
+                dates.add(date_str)
+
+        # Sort dates descending (newest first)
+        for date_str in sorted(dates, reverse=True):
+            response.append({
+                "category_id": f"dvr_date_{date_str}",
+                "category_name": date_str,
+                "parent_id": 0,
+            })
 
     return response
 
