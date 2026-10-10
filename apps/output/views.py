@@ -34,6 +34,7 @@ from apps.output.dummy_epg import (
 )
 from apps.output.epg import generate_epg
 from apps.channels.models import Recording
+from rest_framework_simplejwt.tokens import AccessToken
 from apps.vod.image_proxy import (
     is_proxyable_image_url,
     prefer_relation_artwork,
@@ -515,6 +516,20 @@ def _get_dvr_recordings_queryset(profile_name=None):
     return qs.select_related("channel", "channel__logo", "channel__channel_group")
 
 
+def _generate_dvr_playlist_token(recording_id, expires_seconds=86400):
+    """Generate a short-lived JWT access token for DVR playlist entries.
+
+    Uses simplejwt AccessToken with a custom `rec_id` claim for recording-scoped
+    tokens. TTL defaults to 1 hour (3600s) to balance security and usability.
+    No user association needed - the token just carries the recording_id claim.
+    """
+    token = AccessToken()
+    token.set_exp(from_time=timezone.now() + timedelta(seconds=expires_seconds))
+    token["rec_id"] = str(recording_id)
+    token["type"] = "dvr_playlist"
+    return str(token)
+
+
 def generate_dvr_m3u(request, profile_name=None, user=None):
     """Generate M3U playlist for DVR recordings (in-progress + completed).
 
@@ -567,8 +582,10 @@ def generate_dvr_m3u(request, profile_name=None, user=None):
         else:
             continue
 
-        # No token needed - playback endpoints handle auth via ?token= or headers
-        # Token will be added by TiviMate or client if needed
+        # Generate short-lived token for this recording (1 hour TTL)
+        # Playback endpoints accept token via ?token= query param
+        token = _generate_dvr_playlist_token(rec.id)
+        playback_url = f"{playback_url}?token={token}"
 
         # Channel info
         channel = rec.channel
