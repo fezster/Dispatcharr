@@ -1805,7 +1805,7 @@ def xc_get_series(request, user, category_id=None):
 
     # DVR series (channels with recordings) - handle "dvr", "dvr_in_progress", and date categories
     if (category_id is None or category_id == "dvr" or category_id == "dvr_in_progress" or category_id.startswith("dvr_date_")) and is_dvr_view_enabled(user=user):
-        from apps.channels.models import Recording
+        from apps.channels.models import Recording, Channel
         from django.db.models import Q
         from django.utils import timezone as django_timezone
 
@@ -1846,20 +1846,37 @@ def xc_get_series(request, user, category_id=None):
         _logo_url_prefix = base_url + logo_prefix_raw + "/"
         _logo_url_suffix = "/" + logo_suffix_raw
 
-        # Determine category_id for each series
-        if category_id == "dvr_in_progress":
-            cat_id = "dvr_in_progress"
-            cat_name = "In Progress"
-        elif category_id and category_id.startswith("dvr_date_"):
-            cat_id = category_id
-            cat_name = category_id.replace("dvr_date_", "")
-        else:
-            cat_id = "dvr"
-            cat_name = "DVR Recordings"
-
+        # For each channel, determine the appropriate category based on its recordings
+        # When category_id is None (get all), assign per-channel category
+        # When specific category is requested, use that category for all
         for channel in channels:
             num += 1
             dvr_series_id = -channel.id
+
+            # Determine category for this specific channel
+            if category_id is None:
+                # Check this channel's recordings to assign correct category
+                channel_recordings = recordings_qs.filter(channel_id=channel.id)
+                has_in_progress = channel_recordings.filter(custom_properties__has_key="_hls_dir").exists()
+                if has_in_progress:
+                    cat_id = "dvr_in_progress"
+                else:
+                    # Get the most recent completed recording date for this channel
+                    completed_rec = channel_recordings.filter(
+                        custom_properties__has_key="file_path",
+                        start_time__isnull=False
+                    ).order_by('-start_time').first()
+                    if completed_rec and completed_rec.start_time:
+                        date_str = completed_rec.start_time.strftime("%d-%b-%Y").upper()
+                        cat_id = f"dvr_date_{date_str}"
+                    else:
+                        cat_id = "dvr"
+            elif category_id == "dvr_in_progress":
+                cat_id = "dvr_in_progress"
+            elif category_id and category_id.startswith("dvr_date_"):
+                cat_id = category_id
+            else:
+                cat_id = "dvr"
 
             logo = channel.logo
             cover = None
