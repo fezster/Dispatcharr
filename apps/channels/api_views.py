@@ -3805,6 +3805,7 @@ class RecordingViewSet(viewsets.ModelViewSet):
             )
             auth_suffix = _recording_auth_query_suffix(request)
             lines = []
+            start_tag_added = False
             with open(requested) as _f:
                 for line in _f:
                     stripped = line.strip()
@@ -3812,6 +3813,11 @@ class RecordingViewSet(viewsets.ModelViewSet):
                         lines.append(f"{base_url}{stripped}{auth_suffix}\n")
                     else:
                         lines.append(line)
+                        # Add EXT-X-START after PLAYLIST-TYPE:EVENT for in-progress recordings
+                        # to hint players to start from the beginning (TIME-OFFSET=0)
+                        if not start_tag_added and stripped == "#EXT-X-PLAYLIST-TYPE:EVENT":
+                            lines.append("#EXT-X-START:TIME-OFFSET=0\n")
+                            start_tag_added = True
 
             resp = HttpResponse("".join(lines), content_type="application/x-mpegURL")
             resp["Cache-Control"] = "no-cache"
