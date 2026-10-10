@@ -34,10 +34,6 @@ from apps.output.dummy_epg import (
 )
 from apps.output.epg import generate_epg
 from apps.channels.models import Recording
-from apps.channels.dvr_access import recordings_queryset_for_user, is_dvr_view_enabled
-from apps.channels.api_views import _recording_auth_query_suffix
-from rest_framework_simplejwt.tokens import AccessToken
-from rest_framework_simplejwt.settings import api_settings as jwt_settings
 from apps.vod.image_proxy import (
     is_proxyable_image_url,
     prefer_relation_artwork,
@@ -491,25 +487,15 @@ def generate_m3u(request, profile_name=None, user=None):
     return response
 
 
-def _generate_dvr_playlist_token(user, recording_id, expires_seconds=3600):
-    """Generate a short-lived JWT access token for DVR playlist entries.
-
-    Uses simplejwt AccessToken with a custom `rec_id` claim for recording-scoped
-    tokens. TTL defaults to 1 hour (3600s) to balance security and usability.
-    """
-    token = AccessToken.for_user(user)
-    token.set_exp(from_time=timezone.now() + timedelta(seconds=expires_seconds))
-    token["rec_id"] = str(recording_id)
-    token["type"] = "dvr_playlist"
-    return str(token)
-
-
-def _get_dvr_recordings_queryset(user, profile_name=None):
-    """Get recordings queryset filtered by user access and optional profile."""
+def _get_dvr_recordings_queryset(profile_name=None):
+    """Get recordings queryset filtered by optional profile."""
     from apps.channels.models import ChannelProfile, Channel
 
-    # Start with all recordings, scoped to user's DVR access
-    qs = recordings_queryset_for_user(Recording.objects.all(), user)
+    # Start with all recordings that have playback URLs
+    qs = Recording.objects.filter(
+        Q(custom_properties__has_key="_hls_dir") |
+        Q(custom_properties__has_key="file_path")
+    )
 
     # If profile_name specified, filter to channels in that profile
     if profile_name is not None:
@@ -526,13 +512,6 @@ def _get_dvr_recordings_queryset(user, profile_name=None):
         ).values_list('id', flat=True)
         qs = qs.filter(channel_id__in=channel_ids)
 
-    # Only include recordings that have a playback URL (in-progress or completed)
-    # In-progress: has _hls_dir, Completed: has file_path
-    qs = qs.filter(
-        Q(custom_properties__has_key="_hls_dir") |
-        Q(custom_properties__has_key="file_path")
-    )
-
     return qs.select_related("channel", "channel__logo", "channel__channel_group")
 
 
@@ -541,7 +520,7 @@ def generate_dvr_m3u(request, profile_name=None, user=None):
 
     Endpoints: /output/m3u/dvr/ and /output/m3u/dvr/{profile_name}/
     """
-    logger.debug("Generating DVR M3U for profile: %s, user: %s", profile_name, user.username if user else "Anonymous")
+    logger.debug("Generating DVR M3U for profile: %s", profile_name)
 
     if not network_access_allowed(request, "M3U_EPG"):
         from core.utils import log_system_event
@@ -562,14 +541,8 @@ def generate_dvr_m3u(request, profile_name=None, user=None):
         response["Content-Disposition"] = 'attachment; filename="dvr_recordings.m3u"'
         return response
 
-    if user is None:
-        return JsonResponse({"error": "Authentication required for DVR playlist"}, status=401)
-
-    if not is_dvr_view_enabled(user=user):
-        return JsonResponse({"error": "DVR access not enabled for this user"}, status=403)
-
-    # Get recordings user can access
-    recordings = _get_dvr_recordings_queryset(user, profile_name)
+    # Get recordings (filtered by profile if specified)
+    recordings = _get_dvr_recordings_queryset(profile_name)
 
     # Build base URL for playback endpoints
     base_url = build_absolute_uri_with_port(request, "")
@@ -594,9 +567,8 @@ def generate_dvr_m3u(request, profile_name=None, user=None):
         else:
             continue
 
-        # Generate short-lived token for this recording
-        token = _generate_dvr_playlist_token(user, rec.id)
-        playback_url = f"{playback_url}?token={token}"
+        # No token needed - playback endpoints handle auth via ?token= or headers
+        # Token will be added by TiviMate or client if needed
 
         # Channel info
         channel = rec.channel
@@ -651,7 +623,7 @@ def generate_dvr_epg(request, profile_name=None, user=None):
 
     Endpoints: /output/epg/dvr/ and /output/epg/dvr/{profile_name}/
     """
-    logger.debug("Generating DVR EPG for profile: %s, user: %s", profile_name, user.username if user else "Anonymous")
+    logger.debug("Generating DVR EPG for profile: %s", profile_name)
 
     if not network_access_allowed(request, "M3U_EPG"):
         from core.utils import log_system_event
@@ -673,14 +645,8 @@ def generate_dvr_epg(request, profile_name=None, user=None):
         response["Cache-Control"] = "no-cache"
         return response
 
-    if user is None:
-        return JsonResponse({"error": "Authentication required for DVR EPG"}, status=401)
-
-    if not is_dvr_view_enabled(user=user):
-        return JsonResponse({"error": "DVR access not enabled for this user"}, status=403)
-
-    # Get recordings user can access
-    recordings = _get_dvr_recordings_queryset(user, profile_name)
+    # Get recordings (filtered by profile if specified)
+    recordings = _get_dvr_recordings_queryset(profile_name)
 
     base_url = build_absolute_uri_with_port(request, "")
 
