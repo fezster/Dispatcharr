@@ -1874,6 +1874,12 @@ def xc_get_series_info(request, user, series_id):
         seasons = {}
         base_url = build_absolute_uri_with_port(request, "")
 
+        # Precompute channel logo URL parts (uses /api/channels/logos/{id}/cache/, not /api/channels/logo/)
+        logo_sample_path = reverse("api:channels:logo-cache", args=[0])
+        logo_prefix_raw, _, logo_suffix_raw = logo_sample_path.partition("/0/")
+        _logo_url_prefix = base_url + logo_prefix_raw + "/"
+        _logo_url_suffix = "/" + logo_suffix_raw
+
         for rec in recordings:
             cp = rec.custom_properties or {}
             program = cp.get("program", {})
@@ -1907,7 +1913,7 @@ def xc_get_series_info(request, user, series_id):
             logo = channel.logo
             cover = None
             if logo:
-                cover = f"{base_url}/api/channels/logo/{logo.id}/"
+                cover = f"{_logo_url_prefix}{logo.id}{_logo_url_suffix}"
 
             seasons[season_num].append({
                 "id": -rec.id,  # Negative ID for DVR episodes
@@ -1946,7 +1952,7 @@ def xc_get_series_info(request, user, series_id):
         logo = channel.logo
         series_cover = None
         if logo:
-            series_cover = f"{base_url}/api/channels/logo/{logo.id}/"
+            series_cover = f"{_logo_url_prefix}{logo.id}{_logo_url_suffix}"
 
         group_name = channel.channel_group.name if channel.channel_group else "DVR"
 
