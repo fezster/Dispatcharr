@@ -1872,18 +1872,19 @@ def xc_get_series(request, user, category_id=None):
             if category_id is None:
                 # Check this channel's recordings to assign correct category
                 channel_recordings = recordings_qs.filter(channel_id=channel.id)
-                has_in_progress = channel_recordings.filter(custom_properties__has_key="_hls_dir").exists()
-                if has_in_progress:
-                    cat_id = "-1"
+                # First, check for completed recordings (most recent completed determines date category)
+                completed_rec = channel_recordings.filter(
+                    custom_properties__has_key="file_path",
+                    start_time__isnull=False
+                ).order_by('-start_time').first()
+                if completed_rec and completed_rec.start_time:
+                    dt = completed_rec.start_time
+                    cat_id = f"-{dt.year}{dt.month:02d}{dt.day:02d}"
                 else:
-                    # Get the most recent completed recording date for this channel
-                    completed_rec = channel_recordings.filter(
-                        custom_properties__has_key="file_path",
-                        start_time__isnull=False
-                    ).order_by('-start_time').first()
-                    if completed_rec and completed_rec.start_time:
-                        dt = completed_rec.start_time
-                        cat_id = f"-{dt.year}{dt.month:02d}{dt.day:02d}"
+                    # No completed recordings - check for in-progress
+                    has_in_progress = channel_recordings.filter(custom_properties__has_key="_hls_dir").exists()
+                    if has_in_progress:
+                        cat_id = "-1"
                     else:
                         cat_id = "-999"  # Generic DVR fallback
             elif category_id == "-1":
@@ -2053,18 +2054,19 @@ def xc_get_series_info(request, user, series_id):
         group_name = channel.channel_group.name if channel.channel_group else "DVR"
 
         # Determine category for this series based on its recordings (numeric IDs)
-        has_in_progress = recordings.filter(custom_properties__has_key="_hls_dir").exists()
-        if has_in_progress:
-            cat_id = "-1"
+        # Prioritize completed recordings; only "In Progress" if no completed recordings
+        completed_rec = recordings.filter(
+            custom_properties__has_key="file_path",
+            start_time__isnull=False
+        ).order_by('-start_time').first()
+        if completed_rec and completed_rec.start_time:
+            dt = completed_rec.start_time
+            cat_id = f"-{dt.year}{dt.month:02d}{dt.day:02d}"
         else:
-            # Get the most recent completed recording date
-            completed_rec = recordings.filter(
-                custom_properties__has_key="file_path",
-                start_time__isnull=False
-            ).order_by('-start_time').first()
-            if completed_rec and completed_rec.start_time:
-                dt = completed_rec.start_time
-                cat_id = f"-{dt.year}{dt.month:02d}{dt.day:02d}"
+            # No completed recordings - check for in-progress
+            has_in_progress = recordings.filter(custom_properties__has_key="_hls_dir").exists()
+            if has_in_progress:
+                cat_id = "-1"
             else:
                 cat_id = "-999"
 
