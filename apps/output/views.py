@@ -2037,6 +2037,22 @@ def xc_get_series_info(request, user, series_id):
 
         group_name = channel.channel_group.name if channel.channel_group else "DVR"
 
+        # Determine category for this series based on its recordings
+        has_in_progress = recordings.filter(custom_properties__has_key="_hls_dir").exists()
+        if has_in_progress:
+            cat_id = "dvr_in_progress"
+        else:
+            # Get the most recent completed recording date
+            completed_rec = recordings.filter(
+                custom_properties__has_key="file_path",
+                start_time__isnull=False
+            ).order_by('-start_time').first()
+            if completed_rec and completed_rec.start_time:
+                date_str = completed_rec.start_time.strftime("%d-%b-%Y").upper()
+                cat_id = f"dvr_date_{date_str}"
+            else:
+                cat_id = "dvr"
+
         info = {
             'seasons': seasons_list,
             "info": {
@@ -2057,8 +2073,8 @@ def xc_get_series_info(request, user, series_id):
                 "imdb": "",
                 "tmdb": "",
                 "episode_run_time": "",
-                "category_id": "dvr",
-                "category_ids": ["dvr"],
+                "category_id": cat_id,
+                "category_ids": [cat_id],
             },
             "episodes": dict(seasons)
         }
