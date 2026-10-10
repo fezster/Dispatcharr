@@ -4,7 +4,7 @@ from django.urls import reverse
 from apps.channels.models import Channel, ChannelProfile, ChannelGroup, Stream
 from apps.channels.utils import MAX_AUTO_PREV_DAYS, format_channel_number, is_catchup_enabled
 from apps.vod.utils import is_vod_movies_enabled, is_vod_series_enabled
-from django.db.models import Prefetch
+from django.db.models import Prefetch, Q
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
 from apps.epg.models import ProgramData
@@ -33,6 +33,11 @@ from apps.output.dummy_epg import (
     resolve_channel_parse_name,
 )
 from apps.output.epg import generate_epg
+from apps.channels.models import Recording
+from apps.channels.dvr_access import recordings_queryset_for_user, is_dvr_view_enabled
+from apps.channels.api_views import _recording_auth_query_suffix
+from rest_framework_simplejwt.tokens import AccessToken
+from rest_framework_simplejwt.settings import api_settings as jwt_settings
 from apps.vod.image_proxy import (
     is_proxyable_image_url,
     prefer_relation_artwork,
@@ -483,6 +488,258 @@ def generate_m3u(request, profile_name=None, user=None):
 
     response = HttpResponse(m3u_content, content_type="audio/x-mpegurl")
     response["Content-Disposition"] = 'attachment; filename="channels.m3u"'
+    return response
+
+
+def _generate_dvr_playlist_token(user, recording_id, expires_seconds=3600):
+    """Generate a short-lived JWT access token for DVR playlist entries.
+
+    Uses simplejwt AccessToken with a custom `rec_id` claim for recording-scoped
+    tokens. TTL defaults to 1 hour (3600s) to balance security and usability.
+    """
+    token = AccessToken.for_user(user)
+    token.set_exp(from_time=timezone.now() + timedelta(seconds=expires_seconds))
+    token["rec_id"] = str(recording_id)
+    token["type"] = "dvr_playlist"
+    return str(token)
+
+
+def _get_dvr_recordings_queryset(user, profile_name=None):
+    """Get recordings queryset filtered by user access and optional profile."""
+    from apps.channels.models import ChannelProfile, Channel
+
+    # Start with all recordings, scoped to user's DVR access
+    qs = recordings_queryset_for_user(Recording.objects.all(), user)
+
+    # If profile_name specified, filter to channels in that profile
+    if profile_name is not None:
+        try:
+            channel_profile = ChannelProfile.objects.get(name=profile_name)
+        except ChannelProfile.DoesNotExist:
+            logger.warning("Requested channel profile (%s) during DVR M3U generation does not exist", profile_name)
+            raise Http404(f"Channel profile '{profile_name}' not found")
+
+        # Filter recordings to only those whose channel is in this profile
+        channel_ids = Channel.objects.filter(
+            channelprofilemembership__channel_profile=channel_profile,
+            channelprofilemembership__enabled=True
+        ).values_list('id', flat=True)
+        qs = qs.filter(channel_id__in=channel_ids)
+
+    # Only include recordings that have a playback URL (in-progress or completed)
+    # In-progress: has _hls_dir, Completed: has file_path
+    qs = qs.filter(
+        Q(custom_properties__has_key="_hls_dir") |
+        Q(custom_properties__has_key="file_path")
+    )
+
+    return qs.select_related("channel", "channel__logo", "channel__channel_group")
+
+
+def generate_dvr_m3u(request, profile_name=None, user=None):
+    """Generate M3U playlist for DVR recordings (in-progress + completed).
+
+    Endpoints: /output/m3u/dvr/ and /output/m3u/dvr/{profile_name}/
+    """
+    logger.debug("Generating DVR M3U for profile: %s, user: %s", profile_name, user.username if user else "Anonymous")
+
+    if not network_access_allowed(request, "M3U_EPG"):
+        from core.utils import log_system_event
+        client_ip = get_client_ip(request) or "unknown"
+        user_agent = request.META.get('HTTP_USER_AGENT', 'unknown')
+        log_system_event(
+            event_type='m3u_blocked',
+            profile=f"dvr/{profile_name or 'all'}",
+            reason='Network access denied',
+            client_ip=client_ip,
+            user_agent=user_agent,
+        )
+        return JsonResponse({"error": "Forbidden"}, status=403)
+
+    if request.method == "HEAD":
+        logger.debug("Handling HEAD request for DVR M3U")
+        response = HttpResponse(content_type="audio/x-mpegurl")
+        response["Content-Disposition"] = 'attachment; filename="dvr_recordings.m3u"'
+        return response
+
+    if user is None:
+        return JsonResponse({"error": "Authentication required for DVR playlist"}, status=401)
+
+    if not is_dvr_view_enabled(user=user):
+        return JsonResponse({"error": "DVR access not enabled for this user"}, status=403)
+
+    # Get recordings user can access
+    recordings = _get_dvr_recordings_queryset(user, profile_name)
+
+    # Build base URL for playback endpoints
+    base_url = build_absolute_uri_with_port(request, "")
+
+    m3u_lines = ['#EXTM3U\n']
+
+    for rec in recordings:
+        cp = rec.custom_properties or {}
+
+        # Determine if in-progress (HLS) or completed (file)
+        hls_dir = cp.get("_hls_dir")
+        file_path = cp.get("file_path")
+
+        if hls_dir:
+            # In-progress recording - HLS playlist
+            playback_url = f"{base_url}/api/channels/recordings/{rec.id}/hls/index.m3u8"
+            status_label = " (In Progress)"
+        elif file_path:
+            # Completed recording - file endpoint
+            playback_url = f"{base_url}/api/channels/recordings/{rec.id}/file/"
+            status_label = " (Completed)"
+        else:
+            continue
+
+        # Generate short-lived token for this recording
+        token = _generate_dvr_playlist_token(user, rec.id)
+        playback_url = f"{playback_url}?token={token}"
+
+        # Channel info
+        channel = rec.channel
+        channel_name = channel.name
+
+        # Program info from custom_properties
+        program = cp.get("program", {})
+        title = program.get("title", channel_name)
+        description = program.get("description", "")
+        season = program.get("season")
+        episode = program.get("episode")
+
+        # Build display name
+        display_name = title
+        if season is not None and episode is not None:
+            display_name = f"{title} S{season:02d}E{episode:02d}"
+        display_name += status_label
+
+        # Group title
+        group_title = "DVR Recordings"
+        if channel.channel_group:
+            group_title = f"DVR - {channel.channel_group.name}"
+
+        # Logo
+        tvg_logo = ""
+        logo = channel.logo
+        if logo:
+            tvg_logo = f"{base_url}/api/channels/logo/{logo.id}/"
+
+        # tvg-id
+        tvg_id = f"dvr_rec_{rec.id}"
+
+        # Duration for EXTINF (approximate)
+        duration = int((rec.end_time - rec.start_time).total_seconds())
+
+        extinf_line = (
+            f'#EXTINF:{duration} tvg-id="{tvg_id}" tvg-name="{title}" '
+            f'tvg-logo="{tvg_logo}" group-title="{group_title}",{display_name}\n'
+        )
+
+        m3u_lines.append(extinf_line + playback_url + "\n")
+
+    m3u_content = "".join(m3u_lines)
+
+    response = HttpResponse(m3u_content, content_type="audio/x-mpegurl")
+    response["Content-Disposition"] = 'attachment; filename="dvr_recordings.m3u"'
+    return response
+
+
+def generate_dvr_epg(request, profile_name=None, user=None):
+    """Generate XMLTV EPG for DVR recordings.
+
+    Endpoints: /output/epg/dvr/ and /output/epg/dvr/{profile_name}/
+    """
+    logger.debug("Generating DVR EPG for profile: %s, user: %s", profile_name, user.username if user else "Anonymous")
+
+    if not network_access_allowed(request, "M3U_EPG"):
+        from core.utils import log_system_event
+        client_ip = get_client_ip(request) or "unknown"
+        user_agent = request.META.get('HTTP_USER_AGENT', 'unknown')
+        log_system_event(
+            event_type='epg_blocked',
+            profile=f"dvr/{profile_name or 'all'}",
+            reason='Network access denied',
+            client_ip=client_ip,
+            user_agent=user_agent,
+        )
+        return JsonResponse({"error": "Forbidden"}, status=403)
+
+    if request.method == "HEAD":
+        logger.debug("Handling HEAD request for DVR EPG")
+        response = HttpResponse(content_type="application/xml")
+        response["Content-Disposition"] = 'attachment; filename="dvr_recordings.xml"'
+        response["Cache-Control"] = "no-cache"
+        return response
+
+    if user is None:
+        return JsonResponse({"error": "Authentication required for DVR EPG"}, status=401)
+
+    if not is_dvr_view_enabled(user=user):
+        return JsonResponse({"error": "DVR access not enabled for this user"}, status=403)
+
+    # Get recordings user can access
+    recordings = _get_dvr_recordings_queryset(user, profile_name)
+
+    base_url = build_absolute_uri_with_port(request, "")
+
+    # Generate XMLTV
+    from django.utils import timezone as django_timezone
+    from datetime import timezone as dt_timezone
+
+    now = django_timezone.now()
+
+    xml_lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<tv generator-info-name="Dispatcharr DVR" generator-info-url="{}">'.format(base_url),
+    ]
+
+    channel_ids_seen = set()
+
+    for rec in recordings:
+        cp = rec.custom_properties or {}
+        channel = rec.channel
+        program = cp.get("program", {})
+
+        # Channel ID is per-channel (not per-recording) for XMLTV validity
+        channel_id = f"dvr_ch_{channel.id}"
+
+        # Add channel entry if not seen
+        if channel.id not in channel_ids_seen:
+            channel_ids_seen.add(channel.id)
+            logo = channel.logo
+            logo_url = ""
+            if logo:
+                logo_url = f"{base_url}/api/channels/logo/{logo.id}/"
+            xml_lines.append(
+                f'  <channel id="{channel_id}">'
+                f'<display-name>{html.escape(channel.name)}</display-name>'
+                f'{f"<icon src=\"{logo_url}\"/>" if logo_url else ""}'
+                f'</channel>'
+            )
+
+        # Program entry
+        title = program.get("title", channel.name)
+        description = program.get("description", "")
+        start = rec.start_time.astimezone(dt_timezone.utc).strftime("%Y%m%d%H%M%S %z")
+        stop = rec.end_time.astimezone(dt_timezone.utc).strftime("%Y%m%d%H%M%S %z")
+
+        xml_lines.append(
+            f'  <programme channel="{channel_id}" start="{start}" stop="{stop}">'
+            f'<title lang="en">{html.escape(title)}</title>'
+            f'{f"<desc lang=\"en\">{html.escape(description)}</desc>" if description else ""}'
+            f'{f"<episode-num system=\"xmltv_ns\">{int(program.get("season", 1))-1}.{int(program.get("episode", 1))-1}.0/1</episode-num>" if program.get("season") and program.get("episode") else ""}'
+            f'</programme>'
+        )
+
+    xml_lines.append('</tv>')
+
+    xml_content = "\n".join(xml_lines)
+
+    response = HttpResponse(xml_content, content_type="application/xml")
+    response["Content-Disposition"] = 'attachment; filename="dvr_recordings.xml"'
+    response["Cache-Control"] = "no-cache"
     return response
 
 

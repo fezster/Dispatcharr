@@ -19,6 +19,8 @@ from apps.output.views import (
     xc_get_vod_categories,
     xc_get_vod_info,
     xc_get_vod_streams,
+    generate_dvr_m3u,
+    generate_dvr_epg,
 )
 from apps.vod.models import (
     M3UMovieRelation,
@@ -28,6 +30,8 @@ from apps.vod.models import (
     VODCategory,
     VODLogo,
 )
+from apps.channels.models import Recording
+from django.utils import timezone
 import re
 import xml.etree.ElementTree as ET
 from datetime import timedelta
@@ -2074,3 +2078,253 @@ class XcVodAccessFlagTests(TestCase):
         self.assertEqual(
             [c["name"] for c in xc_get_live_streams(self.request, user)], ["Live One"]
         )
+
+
+class DVRPlaylistTestMixin:
+    """Mixin to set up common DVR playlist test fixtures."""
+
+    def setUp(self):
+        super().setUp()
+        self.factory = RequestFactory()
+        self.group = ChannelGroup.objects.create(name=f"DVR Group {uuid4().hex[:8]}")
+        self.channel = Channel.objects.create(
+            name="DVR Channel",
+            channel_number=1,
+            channel_group=self.group,
+            user_level=0,
+        )
+        self.user = User.objects.create_user(
+            username=f"dvr-user-{uuid4().hex[:8]}",
+            password="pass",
+            user_level=1,
+            custom_properties={"dvr_access": "view"},
+        )
+        self.admin_user = User.objects.create_user(
+            username=f"dvr-admin-{uuid4().hex[:8]}",
+            password="pass",
+            user_level=10,
+        )
+
+
+class DVRM3UTests(DVRPlaylistTestMixin, OutputEndpointTestMixin, TestCase):
+    """Tests for /output/m3u/dvr/ endpoint."""
+
+    def _create_recording(self, channel, status, **cp_extra):
+        """Create a recording with given status and custom properties."""
+        cp = {
+            "status": status,
+            "file_name": f"recording_{status}.mkv",
+            "program": {"title": f"Show {status}", "description": "Test"},
+        }
+        cp.update(cp_extra)
+        now = timezone.now()
+        return Recording.objects.create(
+            channel=channel,
+            start_time=now - timedelta(hours=1),
+            end_time=now + timedelta(hours=1),
+            custom_properties=cp,
+        )
+
+    def _request(self, user, profile_name=None):
+        url = reverse("output:dvr_m3u", kwargs={"profile_name": profile_name} if profile_name else {})
+        request = self.factory.get(url)
+        request.user = user
+        return request
+
+    def test_generate_dvr_m3u_requires_auth(self):
+        """Unauthenticated requests should return 401."""
+        request = self._request(None)
+        request.user = None
+        response = generate_dvr_m3u(request)
+        self.assertEqual(response.status_code, 401)
+
+    def test_generate_dvr_m3u_requires_dvr_view(self):
+        """User without DVR view access should get 403."""
+        no_dvr = User.objects.create_user(username="nodvr", password="pass", user_level=1)
+        request = self._request(no_dvr)
+        response = generate_dvr_m3u(request)
+        self.assertEqual(response.status_code, 403)
+
+    def test_generate_dvr_m3u_in_progress_recording(self):
+        """In-progress recording should appear with HLS URL."""
+        self._create_recording(self.channel, "recording", _hls_dir="/data/recordings/.dvr_1_hls")
+        request = self._request(self.user)
+        response = generate_dvr_m3u(request)
+
+        self.assertEqual(response.status_code, 200)
+        content = _response_text(response)
+        self.assertIn("#EXTM3U", content)
+        self.assertIn("Show recording (In Progress)", content)
+        self.assertIn("/hls/index.m3u8?token=", content)
+
+    def test_generate_dvr_m3u_completed_recording(self):
+        """Completed recording should appear with file URL."""
+        self._create_recording(self.channel, "completed", file_path="/data/recordings/show.mkv")
+        request = self._request(self.user)
+        response = generate_dvr_m3u(request)
+
+        self.assertEqual(response.status_code, 200)
+        content = _response_text(response)
+        self.assertIn("Show completed (Completed)", content)
+        self.assertIn("/file/?token=", content)
+
+    def test_generate_dvr_m3u_both_types(self):
+        """Playlist should include both in-progress and completed recordings."""
+        self._create_recording(self.channel, "recording", _hls_dir="/data/recordings/.dvr_1_hls")
+        self._create_recording(self.channel, "completed", file_path="/data/recordings/show.mkv")
+        request = self._request(self.user)
+        response = generate_dvr_m3u(request)
+
+        content = _response_text(response)
+        self.assertIn("Show recording (In Progress)", content)
+        self.assertIn("Show completed (Completed)", content)
+
+    def test_generate_dvr_m3u_profile_filter(self):
+        """Profile filter should only include recordings from channels in profile."""
+        profile = ChannelProfile.objects.create(name="Test DVR Profile")
+        ChannelProfileMembership.objects.create(channel_profile=profile, channel=self.channel, enabled=True)
+
+        # Create another channel NOT in profile
+        other_channel = Channel.objects.create(name="Other", channel_number=2, channel_group=self.group, user_level=0)
+        self._create_recording(self.channel, "completed", file_path="/data/recordings/in_profile.mkv")
+        self._create_recording(other_channel, "completed", file_path="/data/recordings/out_profile.mkv")
+
+        request = self._request(self.user, profile_name="Test DVR Profile")
+        response = generate_dvr_m3u(request)
+
+        content = _response_text(response)
+        self.assertIn("in_profile", content)
+        self.assertNotIn("out_profile", content)
+
+    def test_generate_dvr_m3u_invalid_profile(self):
+        """Invalid profile name should return 404."""
+        request = self._request(self.user, profile_name="nonexistent")
+        response = generate_dvr_m3u(request)
+        self.assertEqual(response.status_code, 404)
+
+    def test_generate_dvr_m3u_token_in_url(self):
+        """Each entry should have a unique token query parameter."""
+        self._create_recording(self.channel, "completed", file_path="/data/recordings/show.mkv")
+        request = self._request(self.user)
+        response = generate_dvr_m3u(request)
+
+        content = _response_text(response)
+        # Token should be present in the URL
+        self.assertIn("?token=", content)
+        # Token should be a JWT (three base64 parts separated by dots)
+        import re
+        tokens = re.findall(r'\?token=([a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+)', content)
+        self.assertGreater(len(tokens), 0)
+
+
+class DVREPGTests(DVRPlaylistTestMixin, OutputEndpointTestMixin, TestCase):
+    """Tests for /output/epg/dvr/ endpoint."""
+
+    def _create_recording(self, channel, status, **cp_extra):
+        cp = {
+            "status": status,
+            "file_name": f"recording_{status}.mkv",
+            "program": {"title": f"Show {status}", "description": "Test desc", "season": 1, "episode": 2},
+        }
+        cp.update(cp_extra)
+        now = timezone.now()
+        return Recording.objects.create(
+            channel=channel,
+            start_time=now - timedelta(hours=1),
+            end_time=now + timedelta(hours=1),
+            custom_properties=cp,
+        )
+
+    def _request(self, user, profile_name=None):
+        url = reverse("output:dvr_epg", kwargs={"profile_name": profile_name} if profile_name else {})
+        request = self.factory.get(url)
+        request.user = user
+        return request
+
+    def test_generate_dvr_epg_requires_auth(self):
+        """Unauthenticated requests should return 401."""
+        request = self._request(None)
+        request.user = None
+        response = generate_dvr_epg(request)
+        self.assertEqual(response.status_code, 401)
+
+    def test_generate_dvr_epg_requires_dvr_view(self):
+        """User without DVR view access should get 403."""
+        no_dvr = User.objects.create_user(username="nodvr", password="pass", user_level=1)
+        request = self._request(no_dvr)
+        response = generate_dvr_epg(request)
+        self.assertEqual(response.status_code, 403)
+
+    def test_generate_dvr_epg_basic_output(self):
+        """EPG should generate valid XMLTV with recording programmes."""
+        self._create_recording(self.channel, "completed", file_path="/data/recordings/show.mkv")
+        request = self._request(self.user)
+        response = generate_dvr_epg(request)
+
+        self.assertEqual(response.status_code, 200)
+        content = _response_text(response)
+        self.assertIn('<?xml version="1.0" encoding="UTF-8"?>', content)
+        self.assertIn("<tv", content)
+        self.assertIn("<channel", content)
+        self.assertIn("<programme", content)
+        self.assertIn("Show completed", content)
+        self.assertIn("Test desc", content)
+        self.assertIn('episode-num system="xmltv_ns">0.1.0/1</episode-num>', content)
+        # Channel ID should be per-channel format
+        self.assertIn(f'id="dvr_ch_{self.channel.id}"', content)
+        self.assertIn(f'channel="dvr_ch_{self.channel.id}"', content)
+
+    def test_generate_dvr_epg_valid_xml(self):
+        """Generated EPG should be parseable XML."""
+        self._create_recording(self.channel, "completed", file_path="/data/recordings/show.mkv")
+        request = self._request(self.user)
+        response = generate_dvr_epg(request)
+
+        content = _response_text(response)
+        try:
+            ET.fromstring(content)
+        except ET.ParseError as e:
+            self.fail(f"Generated EPG is not valid XML: {e}")
+
+    def test_generate_dvr_epg_multiple_recordings(self):
+        """EPG should include programmes for all accessible recordings."""
+        self._create_recording(self.channel, "completed", file_path="/data/recordings/show1.mkv",
+                               program={"title": "Show 1", "description": "Desc 1"})
+        self._create_recording(self.channel, "recording", _hls_dir="/data/recordings/.dvr_2_hls",
+                               program={"title": "Show 2", "description": "Desc 2"})
+        request = self._request(self.user)
+        response = generate_dvr_epg(request)
+
+        content = _response_text(response)
+        self.assertIn("Show 1", content)
+        self.assertIn("Show 2", content)
+        self.assertIn("Desc 1", content)
+        self.assertIn("Desc 2", content)
+        # Only one channel element since same channel
+        self.assertEqual(content.count(f'id="dvr_ch_{self.channel.id}"'), 1)
+        # But two programme elements referencing it
+        self.assertEqual(content.count(f'channel="dvr_ch_{self.channel.id}"'), 2)
+
+    def test_generate_dvr_epg_profile_filter(self):
+        """Profile filter should only include recordings from channels in profile."""
+        profile = ChannelProfile.objects.create(name="Test EPG Profile")
+        ChannelProfileMembership.objects.create(channel_profile=profile, channel=self.channel, enabled=True)
+
+        other_channel = Channel.objects.create(name="Other", channel_number=2, channel_group=self.group, user_level=0)
+        self._create_recording(self.channel, "completed", file_path="/data/recordings/in_profile.mkv",
+                               program={"title": "In Profile"})
+        self._create_recording(other_channel, "completed", file_path="/data/recordings/out_profile.mkv",
+                               program={"title": "Out Profile"})
+
+        request = self._request(self.user, profile_name="Test EPG Profile")
+        response = generate_dvr_epg(request)
+
+        content = _response_text(response)
+        self.assertIn("In Profile", content)
+        self.assertNotIn("Out Profile", content)
+
+    def test_generate_dvr_epg_invalid_profile(self):
+        """Invalid profile name should return 404."""
+        request = self._request(self.user, profile_name="nonexistent")
+        response = generate_dvr_epg(request)
+        self.assertEqual(response.status_code, 404)
