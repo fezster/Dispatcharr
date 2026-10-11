@@ -576,6 +576,7 @@ def generate_dvr_m3u(request, profile_name=None, user=None):
     """Generate M3U playlist for DVR recordings (in-progress + completed).
 
     Endpoints: /output/m3u/dvr/ and /output/m3u/dvr/{profile_name}/
+    Recordings are grouped by series (channel), with each recording as an episode.
     """
     logger.debug("Generating DVR M3U for profile: %s", profile_name)
 
@@ -599,10 +600,15 @@ def generate_dvr_m3u(request, profile_name=None, user=None):
         return response
 
     # Get recordings (filtered by profile if specified)
-    recordings = _get_dvr_recordings_queryset(profile_name)
+    recordings = _get_dvr_recordings_queryset(profile_name).select_related("channel", "channel__logo", "channel__channel_group")
 
     # Build base URL for playback endpoints
     base_url = build_absolute_uri_with_port(request, "")
+
+    # Import display timezone
+    from dispatcharr.display_timezone import refresh_display_zone, _cache, _env_zone
+    refresh_display_zone()
+    display_tz = _cache["zone"] or _env_zone()
 
     m3u_lines = ['#EXTM3U\n']
 
@@ -640,16 +646,22 @@ def generate_dvr_m3u(request, profile_name=None, user=None):
         season = program.get("season")
         episode = program.get("episode")
 
-        # Build display name
-        display_name = title
+        # Convert times to display timezone for time range
+        local_start = rec.start_time.astimezone(display_tz)
+        local_end = rec.end_time.astimezone(display_tz)
+        start_time_str = local_start.strftime("%H:%M")
+        end_time_str = local_end.strftime("%H:%M")
+        time_range = f"{start_time_str} - {end_time_str}"
+
+        # Build display name with time range prefix (like XC API)
+        # Format: "HH:MM - HH:MM: Title"
+        display_name = f"{time_range}: {title}"
         if season is not None and episode is not None:
-            display_name = f"{title} S{season:02d}E{episode:02d}"
+            display_name = f"{time_range}: {title} S{season:02d}E{episode:02d}"
         display_name += status_label
 
-        # Group title
-        group_title = "DVR Recordings"
-        if channel.channel_group:
-            group_title = f"DVR - {channel.channel_group.name}"
+        # Group title = Series name (channel name) - this makes it appear as a series in TiviMate
+        group_title = channel_name
 
         # Logo
         tvg_logo = ""
