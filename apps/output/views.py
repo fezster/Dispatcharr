@@ -2078,6 +2078,9 @@ def xc_get_series_info(request, user, series_id):
         except Channel.DoesNotExist:
             raise Http404()
 
+        # Get category_id from request for filtering
+        category_id = request.GET.get("category_id")
+
         # Get recordings for this channel accessible to user
         if is_in_progress_series:
             # Only in-progress recordings for In Progress series
@@ -2095,6 +2098,26 @@ def xc_get_series_info(request, user, series_id):
                     custom_properties__has_key="file_path"
                 ), user
             ).select_related("channel").order_by("-start_time")
+
+        # Filter by category_id if it's a date category (format: -YYYYMMDD)
+        if category_id and category_id.startswith("-") and category_id != "-1" and not is_in_progress_series:
+            date_num = category_id[1:]
+            if len(date_num) == 8 and date_num.isdigit():
+                try:
+                    year = int(date_num[:4])
+                    month = int(date_num[4:6])
+                    day = int(date_num[6:8])
+                    # Create date range in display timezone, then convert to UTC for DB query
+                    target_date_display = datetime(year, month, day, tzinfo=display_tz)
+                    next_day_display = target_date_display + timedelta(days=1)
+                    target_start_utc = target_date_display.astimezone(dt_timezone.utc)
+                    target_end_utc = next_day_display.astimezone(dt_timezone.utc)
+                    recordings = recordings.filter(
+                        start_time__gte=target_start_utc,
+                        start_time__lt=target_end_utc,
+                    )
+                except (ValueError, IndexError):
+                    recordings = recordings.none()
 
         # Build episodes from recordings
         seasons = {}
