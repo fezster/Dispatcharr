@@ -1671,6 +1671,11 @@ def xc_get_series_categories(user):
     from apps.channels.models import Recording
     from django.db.models import Q
     from django.utils import timezone as django_timezone
+    from dispatcharr.display_timezone import refresh_display_zone, _cache, _env_zone
+
+    # Refresh display timezone from settings
+    refresh_display_zone()
+    display_tz = _cache["zone"] or _env_zone()
 
     response = []
 
@@ -1712,14 +1717,16 @@ def xc_get_series_categories(user):
         dates = set()
         for start_time in completed_dates:
             if start_time:
-                date_str = start_time.strftime("%d-%b-%Y").upper()
+                # Convert UTC start_time to display timezone for correct date
+                local_time = start_time.astimezone(display_tz)
+                date_str = local_time.strftime("%d-%b-%Y").upper()
                 dates.add(date_str)
 
         # Sort dates descending (newest first)
         for date_str in sorted(dates, reverse=True):
             # Convert date to numeric ID: -YYYYMMDD
             try:
-                dt = django_timezone.datetime.strptime(date_str, "%d-%b-%Y")
+                dt = datetime.strptime(date_str, "%d-%b-%Y")
                 date_id = f"-{dt.year}{dt.month:02d}{dt.day:02d}"
             except ValueError:
                 date_id = f"-{abs(hash(date_str)) % 100000000}"
@@ -1817,6 +1824,11 @@ def xc_get_series(request, user, category_id=None):
         from apps.channels.models import Recording, Channel
         from django.db.models import Q
         from django.utils import timezone as django_timezone
+        from dispatcharr.display_timezone import refresh_display_zone, _cache, _env_zone
+
+        # Refresh display timezone from settings
+        refresh_display_zone()
+        display_tz = _cache["zone"] or _env_zone()
 
         # Get channels that have recordings accessible to this user
         recordings_qs = recordings_queryset_for_user(
@@ -1838,13 +1850,17 @@ def xc_get_series(request, user, category_id=None):
                     year = int(date_num[:4])
                     month = int(date_num[4:6])
                     day = int(date_num[6:8])
-                    target_date = django_timezone.datetime(year, month, day).date()
-                    # Filter recordings where start_time matches the date
-                    recording_ids = []
-                    for rec in recordings_qs.filter(custom_properties__has_key="file_path"):
-                        if rec.start_time and rec.start_time.date() == target_date:
-                            recording_ids.append(rec.id)
-                    recordings_qs = recordings_qs.filter(id__in=recording_ids)
+                    # Create date range in display timezone, then convert to UTC for DB query
+                    target_date_display = display_tz.localize(datetime(year, month, day))
+                    next_day_display = target_date_display + timedelta(days=1)
+                    target_start_utc = target_date_display.astimezone(dt_timezone.utc)
+                    target_end_utc = next_day_display.astimezone(dt_timezone.utc)
+                    # Filter recordings where start_time falls within the display date (in UTC)
+                    recordings_qs = recordings_qs.filter(
+                        custom_properties__has_key="file_path",
+                        start_time__gte=target_start_utc,
+                        start_time__lt=target_end_utc,
+                    )
                 except (ValueError, IndexError):
                     recordings_qs = recordings_qs.none()
             else:
@@ -1915,8 +1931,9 @@ def xc_get_series(request, user, category_id=None):
                         start_time__isnull=False
                     ).order_by('-start_time').first()
                     if completed_rec and completed_rec.start_time:
-                        dt = completed_rec.start_time
-                        cat_id = f"-{dt.year}{dt.month:02d}{dt.day:02d}"
+                        # Convert UTC start_time to display timezone for correct date
+                        local_time = completed_rec.start_time.astimezone(display_tz)
+                        cat_id = f"-{local_time.year}{local_time.month:02d}{local_time.day:02d}"
                     else:
                         cat_id = "-999"
 
@@ -1978,10 +1995,15 @@ def xc_get_series(request, user, category_id=None):
                         year = int(date_num[:4])
                         month = int(date_num[4:6])
                         day = int(date_num[6:8])
-                        target_date = django_timezone.datetime(year, month, day).date()
+                        # Create date range in display timezone, then convert to UTC for DB query
+                        target_date_display = display_tz.localize(datetime(year, month, day))
+                        next_day_display = target_date_display + timedelta(days=1)
+                        target_start_utc = target_date_display.astimezone(dt_timezone.utc)
+                        target_end_utc = next_day_display.astimezone(dt_timezone.utc)
                         date_recordings = channel_recordings.filter(
                             custom_properties__has_key="file_path",
-                            start_time__date=target_date
+                            start_time__gte=target_start_utc,
+                            start_time__lt=target_end_utc,
                         )
                         if date_recordings.exists():
                             num += 1
@@ -2036,6 +2058,13 @@ def xc_get_series_info(request, user, series_id):
         # - In Progress recordings: series_id = -channel_id - 1000000 (e.g., -1000004)
         if not is_dvr_view_enabled(user=user):
             raise Http404()
+
+        # Import display timezone utilities
+        from dispatcharr.display_timezone import refresh_display_zone, _cache, _env_zone
+
+        # Refresh display timezone from settings
+        refresh_display_zone()
+        display_tz = _cache["zone"] or _env_zone()
 
         # Check if this is an In Progress series (series_id < -1000000)
         is_in_progress_series = series_id_int < -1000000
@@ -2104,8 +2133,26 @@ def xc_get_series_info(request, user, series_id):
 
             title = program.get("title", channel.name)
             description = program.get("description", "")
-            start_str = rec.start_time.strftime("%Y-%m-%d %H:%M:%S")
             duration_secs = int((rec.end_time - rec.start_time).total_seconds())
+
+            # Convert start_time to display timezone for air_date and release_date
+            local_start = rec.start_time.astimezone(display_tz)
+            local_end = rec.end_time.astimezone(display_tz)
+            air_date_str = local_start.strftime("%Y-%m-%d %H:%M:%S")
+            release_date_str = local_start.strftime("%Y-%m-%d %H:%M:%S")
+
+            # Format time range for overview: "HH:MM - HH:MM"
+            start_time_str = local_start.strftime("%H:%M")
+            end_time_str = local_end.strftime("%H:%M")
+            time_range = f"{start_time_str} - {end_time_str}"
+
+            # Build overview with time range prefix
+            overview_parts = []
+            if time_range:
+                overview_parts.append(time_range)
+            if description:
+                overview_parts.append(description)
+            overview = "\n\n".join(overview_parts)
 
             logo = channel.logo
             cover = None
@@ -2124,15 +2171,15 @@ def xc_get_series_info(request, user, series_id):
                 "info": {
                     "id": -rec.id,
                     "name": title,
-                    "overview": description,
+                    "overview": overview,
                     "crew": "",
                     "directed_by": "",
                     "imdb_id": "",
-                    "air_date": start_str,
+                    "air_date": air_date_str,
                     "backdrop_path": [],
                     "movie_image": cover,
                     "rating": 0.0,
-                    "release_date": start_str,
+                    "release_date": release_date_str,
                     "duration_secs": duration_secs,
                     "duration": format_duration_hms(duration_secs),
                     "video": {},
@@ -2166,8 +2213,9 @@ def xc_get_series_info(request, user, series_id):
                 start_time__isnull=False
             ).order_by('-start_time').first()
             if completed_rec and completed_rec.start_time:
-                dt = completed_rec.start_time
-                cat_id = f"-{dt.year}{dt.month:02d}{dt.day:02d}"
+                # Convert UTC start_time to display timezone for correct date
+                local_time = completed_rec.start_time.astimezone(display_tz)
+                cat_id = f"-{local_time.year}{local_time.month:02d}{local_time.day:02d}"
             else:
                 cat_id = "-999"
             series_name = channel.name
