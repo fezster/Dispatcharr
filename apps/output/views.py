@@ -2128,10 +2128,13 @@ def xc_get_series_info(request, user, series_id):
             air_date_str = local_start.strftime("%Y-%m-%d %H:%M:%S")
             release_date_str = local_start.strftime("%Y-%m-%d %H:%M:%S")
 
-            # Format time range for overview: "HH:MM - HH:MM"
+            # Format time range: "HH:MM - HH:MM"
             start_time_str = local_start.strftime("%H:%M")
             end_time_str = local_end.strftime("%H:%M")
             time_range = f"{start_time_str} - {end_time_str}"
+
+            # Prepend time range to title: "HH:MM - HH:MM: Title"
+            title_with_time = f"{time_range}: {title}"
 
             # Build overview with time range prefix
             overview_parts = []
@@ -2150,14 +2153,14 @@ def xc_get_series_info(request, user, series_id):
                 "id": -rec.id,  # Negative ID for DVR episodes
                 "season": season_num,
                 "episode_num": episode_num,
-                "title": title,
+                "title": title_with_time,
                 "container_extension": "mp4",
                 "added": str(int(rec.start_time.timestamp())),
                 "custom_sid": None,
                 "direct_source": playback_url,  # Direct playback URL with token
                 "info": {
                     "id": -rec.id,
-                    "name": title,
+                    "name": title_with_time,
                     "overview": overview,
                     "crew": "",
                     "directed_by": "",
