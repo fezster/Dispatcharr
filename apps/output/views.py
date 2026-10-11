@@ -2162,43 +2162,68 @@ def xc_get_series_info(request, user, series_id):
                 cover = f"{_logo_url_prefix}{logo.id}{_logo_url_suffix}"
 
             seasons[season_num].append({
-                "id": -rec.id,  # Negative ID for DVR episodes
+                "id": -rec.id,  # Negative ID is intentional: routes playback to DVR
                 "season": season_num,
                 "episode_num": episode_num,
                 "title": title_with_time,
                 "container_extension": "mp4",
                 "added": str(int(rec.start_time.timestamp())),
-                "custom_sid": None,
+                "custom_sid": "",
                 "direct_source": playback_url,  # Direct playback URL with token
                 "info": {
                     "id": -rec.id,
                     "name": title_with_time,
                     "overview": overview,
+                    "plot": overview,  # TiviMate/most clients read "plot"
                     "crew": "",
                     "directed_by": "",
                     "imdb_id": "",
                     "air_date": air_date_str,
                     "backdrop_path": [],
                     "movie_image": cover,
-                    "rating": 0.0,
+                    "rating": "0",
                     "release_date": release_date_str,
+                    "releasedate": release_date_str[:10],  # most clients read "releasedate"
                     "duration_secs": duration_secs,
                     "duration": format_duration_hms(duration_secs),
-                    "video": {},
-                    "audio": {},
+                    "video": [],
+                    "audio": [],
                     "bitrate": 0,
                 }
             })
-
-        seasons_list = [
-            {"season_number": int(season_num), "name": f"Season {season_num}"}
-            for season_num in sorted(seasons.keys(), key=lambda x: int(x), reverse=True)
-        ]
 
         logo = channel.logo
         series_cover = None
         if logo:
             series_cover = f"{_logo_url_prefix}{logo.id}{_logo_url_suffix}"
+
+        # Complete season entries (id, episode_count, air_date, overview, cover, cover_big)
+        seasons_list = []
+        for season_num in sorted(seasons.keys(), key=lambda x: int(x), reverse=True):
+            season_eps = seasons[season_num]
+            season_air = min(
+                (e["info"]["air_date"][:10] for e in season_eps if e["info"]["air_date"]),
+                default="",
+            )
+            seasons_list.append({
+                "id": int(season_num),
+                "season_number": int(season_num),
+                "name": f"Season {season_num}",
+                "episode_count": len(season_eps),
+                "air_date": season_air,
+                "overview": "",
+                "cover": series_cover or "",
+                "cover_big": series_cover or "",
+            })
+
+        # Average episode length in minutes (non-empty episode_run_time)
+        all_eps = [e for eps in seasons.values() for e in eps]
+        if all_eps:
+            episode_run_time = str(round(
+                sum(e["info"]["duration_secs"] for e in all_eps) / len(all_eps) / 60
+            ))
+        else:
+            episode_run_time = ""
 
         group_name = channel.channel_group.name if channel.channel_group else "DVR"
 
@@ -2247,7 +2272,7 @@ def xc_get_series_info(request, user, series_id):
                 "youtube_trailer": "",
                 "imdb": "",
                 "tmdb": "",
-                "episode_run_time": "",
+                "episode_run_time": episode_run_time,
                 "category_id": cat_id,
                 "category_ids": [cat_id],
             },
