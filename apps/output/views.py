@@ -1851,7 +1851,7 @@ def xc_get_series(request, user, category_id=None):
                     month = int(date_num[4:6])
                     day = int(date_num[6:8])
                     # Create date range in display timezone, then convert to UTC for DB query
-                    target_date_display = display_tz.localize(datetime(year, month, day))
+                    target_date_display = datetime(year, month, day, tzinfo=display_tz)
                     next_day_display = target_date_display + timedelta(days=1)
                     target_start_utc = target_date_display.astimezone(dt_timezone.utc)
                     target_end_utc = next_day_display.astimezone(dt_timezone.utc)
@@ -1996,7 +1996,7 @@ def xc_get_series(request, user, category_id=None):
                         month = int(date_num[4:6])
                         day = int(date_num[6:8])
                         # Create date range in display timezone, then convert to UTC for DB query
-                        target_date_display = display_tz.localize(datetime(year, month, day))
+                        target_date_display = datetime(year, month, day, tzinfo=display_tz)
                         next_day_display = target_date_display + timedelta(days=1)
                         target_start_utc = target_date_display.astimezone(dt_timezone.utc)
                         target_end_utc = next_day_display.astimezone(dt_timezone.utc)
