@@ -12,7 +12,7 @@ from apps.accounts.models import User
 from dispatcharr.utils import get_client_ip, network_access_allowed
 from django.utils import timezone as django_timezone
 from django.shortcuts import get_object_or_404
-from datetime import datetime, timedelta, timezone as dt_timezone
+from datetime import datetime, timedelta, timezone as dt_timezone, date as date_cls
 import html
 import time
 from urllib.parse import urlencode, urlparse
@@ -44,6 +44,48 @@ from apps.vod.image_proxy import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# DVR "date series" helpers
+#
+# Completed recordings are exposed to XC clients as one series per
+# (channel, local recording date). The (channel, date) pair is packed into a
+# single negative series_id so xc_get_series_info can decode it again.
+#
+# ID ranges (absolute values):
+#   1 .. 99_999                      legacy completed series  (-channel_id)
+#   1_000_001 .. ~1_099_999          in-progress series       (-channel_id - 1_000_000)
+#   >= 100_000_000                   completed (channel, date) series
+# Max generated ID is ~2.0 billion, which fits in a signed 32-bit int.
+# Assumes channel ids < DVR_CH_MULT and recording dates on/after DVR_EPOCH.
+# ---------------------------------------------------------------------------
+DVR_DATE_BASE = 100_000_000
+DVR_EPOCH = date_cls(2020, 1, 1)
+DVR_CH_MULT = 100_000
+
+
+def _dvr_date_series_id(channel_id, d):
+    """Pack (channel_id, date) into a negative XC series_id."""
+    return -(DVR_DATE_BASE + (d - DVR_EPOCH).days * DVR_CH_MULT + channel_id)
+
+
+def _decode_dvr_date_series_id(series_id_int):
+    """Return (channel_id, date) for a date-series id, or None if it isn't one."""
+    n = -series_id_int
+    if n < DVR_DATE_BASE:
+        return None
+    day_index, channel_id = divmod(n - DVR_DATE_BASE, DVR_CH_MULT)
+    return channel_id, DVR_EPOCH + timedelta(days=day_index)
+
+
+def _local_day_bounds_utc(d, display_tz):
+    """UTC [start, end) bounds of local calendar day ``d`` in ``display_tz``."""
+    start = datetime(d.year, d.month, d.day, tzinfo=display_tz)
+    return (
+        start.astimezone(dt_timezone.utc),
+        (start + timedelta(days=1)).astimezone(dt_timezone.utc),
+    )
 
 
 def get_client_identifier(request):
@@ -1718,21 +1760,14 @@ def xc_get_series_categories(user):
         for start_time in completed_dates:
             if start_time:
                 # Convert UTC start_time to display timezone for correct date
-                local_time = start_time.astimezone(display_tz)
-                date_str = local_time.strftime("%d-%b-%Y").upper()
-                dates.add(date_str)
+                dates.add(start_time.astimezone(display_tz).date())
 
-        # Sort dates descending (newest first)
-        for date_str in sorted(dates, reverse=True):
-            # Convert date to numeric ID: -YYYYMMDD
-            try:
-                dt = datetime.strptime(date_str, "%d-%b-%Y")
-                date_id = f"-{dt.year}{dt.month:02d}{dt.day:02d}"
-            except ValueError:
-                date_id = f"-{abs(hash(date_str)) % 100000000}"
+        # Sort real dates descending (newest first); sorting the "10-OCT-2026"
+        # strings would order by day-of-month rather than chronologically.
+        for d in sorted(dates, reverse=True):
             response.append({
-                "category_id": date_id,
-                "category_name": date_str,
+                "category_id": f"-{d.strftime('%Y%m%d')}",  # numeric: -YYYYMMDD
+                "category_name": d.strftime("%d-%b-%Y").upper(),
                 "parent_id": 0,
             })
 
@@ -1850,11 +1885,10 @@ def xc_get_series(request, user, category_id=None):
                     year = int(date_num[:4])
                     month = int(date_num[4:6])
                     day = int(date_num[6:8])
-                    # Create date range in display timezone, then convert to UTC for DB query
-                    target_date_display = datetime(year, month, day, tzinfo=display_tz)
-                    next_day_display = target_date_display + timedelta(days=1)
-                    target_start_utc = target_date_display.astimezone(dt_timezone.utc)
-                    target_end_utc = next_day_display.astimezone(dt_timezone.utc)
+                    # Local calendar day in display timezone -> UTC range for the DB query
+                    target_start_utc, target_end_utc = _local_day_bounds_utc(
+                        date_cls(year, month, day), display_tz
+                    )
                     # Filter recordings where start_time falls within the display date (in UTC)
                     recordings_qs = recordings_qs.filter(
                         custom_properties__has_key="file_path",
@@ -1877,13 +1911,19 @@ def xc_get_series(request, user, category_id=None):
         _logo_url_prefix = base_url + logo_prefix_raw + "/"
         _logo_url_suffix = "/" + logo_suffix_raw
 
-        # For each channel, create separate series for in-progress and completed recordings
-        # when getting all series (category_id=None). When specific category requested,
-        # only create series for that category.
+        # Is the request for date series (everything, or one specific -YYYYMMDD)?
+        is_date_request = category_id is None or (
+            category_id.startswith("-")
+            and category_id != "-1"
+            and category_id[1:].isdigit()
+        )
+
+        # For each channel:
+        #   - one "(In Progress)" series if it has in-progress recordings
+        #   - one series PER LOCAL RECORDING DATE for completed recordings, each with
+        #     its own series_id (see _dvr_date_series_id) and its own category_id.
         for channel in channels:
             channel_recordings = recordings_qs.filter(channel_id=channel.id)
-            has_in_progress = channel_recordings.filter(custom_properties__has_key="_hls_dir").exists()
-            has_completed = channel_recordings.filter(custom_properties__has_key="file_path", start_time__isnull=False).exists()
 
             logo = channel.logo
             cover = None
@@ -1892,11 +1932,11 @@ def xc_get_series(request, user, category_id=None):
 
             group_name = channel.channel_group.name if channel.channel_group else "DVR"
 
-            if category_id is None:
-                # Get all series - create separate entries for in-progress and completed
-                if has_in_progress:
+            # --- In Progress series ---
+            if category_id is None or category_id == "-1":
+                if channel_recordings.filter(custom_properties__has_key="_hls_dir").exists():
                     num += 1
-                    # In Progress series: use unique series_id (offset by -1000000)
+                    # In Progress series: unique series_id (offset by -1000000)
                     in_progress_series_id = -channel.id - 1000000
                     append({
                         "num": num,
@@ -1921,28 +1961,28 @@ def xc_get_series(request, user, category_id=None):
                         "imdb_id": "",
                     })
 
-                if has_completed:
-                    num += 1
-                    # Completed recordings series: use original series_id
-                    completed_series_id = -channel.id
-                    # Determine date category from most recent completed recording
-                    completed_rec = channel_recordings.filter(
-                        custom_properties__has_key="file_path",
-                        start_time__isnull=False
-                    ).order_by('-start_time').first()
-                    if completed_rec and completed_rec.start_time:
-                        # Convert UTC start_time to display timezone for correct date
-                        local_time = completed_rec.start_time.astimezone(display_tz)
-                        cat_id = f"-{local_time.year}{local_time.month:02d}{local_time.day:02d}"
-                    else:
-                        cat_id = "-999"
+            # --- Completed series: one per local recording date ---
+            if is_date_request:
+                completed_starts = channel_recordings.filter(
+                    custom_properties__has_key="file_path",
+                    start_time__isnull=False,
+                ).values_list("start_time", flat=True)
+                days = {st.astimezone(display_tz).date() for st in completed_starts}
 
+                if category_id is not None:
+                    # Specific date requested - keep only that day
+                    wanted = category_id[1:]
+                    days = {d for d in days if d.strftime("%Y%m%d") == wanted}
+
+                for d in sorted(days, reverse=True):
+                    num += 1
+                    cat_id = f"-{d.strftime('%Y%m%d')}"
                     append({
                         "num": num,
                         "name": channel.name,
-                        "series_id": completed_series_id,
+                        "series_id": _dvr_date_series_id(channel.id, d),
                         "cover": cover,
-                        "plot": f"DVR recordings from {channel.name}",
+                        "plot": f"DVR recordings from {channel.name} on {d.strftime('%d-%b-%Y').upper()}",
                         "cast": "",
                         "director": "",
                         "genre": group_name,
@@ -1959,77 +1999,6 @@ def xc_get_series(request, user, category_id=None):
                         "tmdb_id": "",
                         "imdb_id": "",
                     })
-            elif category_id == "-1":
-                # Only in-progress category requested
-                if has_in_progress:
-                    num += 1
-                    in_progress_series_id = -channel.id - 1000000
-                    append({
-                        "num": num,
-                        "name": f"{channel.name} (In Progress)",
-                        "series_id": in_progress_series_id,
-                        "cover": cover,
-                        "plot": f"In-progress DVR recordings from {channel.name}",
-                        "cast": "",
-                        "director": "",
-                        "genre": group_name,
-                        "release_date": "",
-                        "releaseDate": "",
-                        "last_modified": str(int(time.time())),
-                        "rating": "0",
-                        "rating_5based": "0",
-                        "backdrop_path": [],
-                        "youtube_trailer": "",
-                        "episode_run_time": "",
-                        "category_id": "-1",
-                        "category_ids": ["-1"],
-                        "tmdb_id": "",
-                        "imdb_id": "",
-                    })
-            elif category_id and category_id.startswith("-") and category_id != "-1":
-                # Specific date category requested
-                if has_completed:
-                    # Check if this channel has recordings for this date
-                    date_num = category_id[1:]
-                    if len(date_num) == 8 and date_num.isdigit():
-                        year = int(date_num[:4])
-                        month = int(date_num[4:6])
-                        day = int(date_num[6:8])
-                        # Create date range in display timezone, then convert to UTC for DB query
-                        target_date_display = datetime(year, month, day, tzinfo=display_tz)
-                        next_day_display = target_date_display + timedelta(days=1)
-                        target_start_utc = target_date_display.astimezone(dt_timezone.utc)
-                        target_end_utc = next_day_display.astimezone(dt_timezone.utc)
-                        date_recordings = channel_recordings.filter(
-                            custom_properties__has_key="file_path",
-                            start_time__gte=target_start_utc,
-                            start_time__lt=target_end_utc,
-                        )
-                        if date_recordings.exists():
-                            num += 1
-                            completed_series_id = -channel.id
-                            append({
-                                "num": num,
-                                "name": channel.name,
-                                "series_id": completed_series_id,
-                                "cover": cover,
-                                "plot": f"DVR recordings from {channel.name}",
-                                "cast": "",
-                                "director": "",
-                                "genre": group_name,
-                                "release_date": "",
-                                "releaseDate": "",
-                                "last_modified": str(int(time.time())),
-                                "rating": "0",
-                                "rating_5based": "0",
-                                "backdrop_path": [],
-                                "youtube_trailer": "",
-                                "episode_run_time": "",
-                                "category_id": category_id,
-                                "category_ids": [category_id],
-                                "tmdb_id": "",
-                                "imdb_id": "",
-                            })
 
     return series_list
 
@@ -2046,7 +2015,7 @@ def xc_get_series_info(request, user, series_id):
     if not series_id:
         raise Http404()
 
-    # Check if this is a DVR series (negative series_id = -channel_id)
+    # Check if this is a DVR series (negative series_id)
     try:
         series_id_int = int(series_id)
     except (ValueError, TypeError):
@@ -2054,7 +2023,9 @@ def xc_get_series_info(request, user, series_id):
 
     if series_id_int < 0:
         # DVR series:
-        # - Completed recordings: series_id = -channel_id (e.g., -4)
+        # - Completed recordings per date: series_id encodes (channel_id, date),
+        #   see _dvr_date_series_id (|id| >= 100_000_000)
+        # - Legacy completed series: series_id = -channel_id (e.g., -4)
         # - In Progress recordings: series_id = -channel_id - 1000000 (e.g., -1000004)
         if not is_dvr_view_enabled(user=user):
             raise Http404()
@@ -2066,20 +2037,25 @@ def xc_get_series_info(request, user, series_id):
         refresh_display_zone()
         display_tz = _cache["zone"] or _env_zone()
 
-        # Check if this is an In Progress series (series_id < -1000000)
-        is_in_progress_series = series_id_int < -1000000
-        if is_in_progress_series:
-            channel_id = -(series_id_int + 1000000)  # Extract channel_id
+        # Decode the series id. The date-series check MUST come first because
+        # those ids are also < -1000000.
+        decoded = _decode_dvr_date_series_id(series_id_int)
+        if decoded:
+            channel_id, series_date = decoded
+            is_in_progress_series = False
+        elif series_id_int < -1000000:
+            is_in_progress_series = True
+            channel_id = -(series_id_int + 1000000)
+            series_date = None
         else:
+            is_in_progress_series = False
             channel_id = -series_id_int
+            series_date = None  # legacy id: all completed recordings for the channel
 
         try:
             channel = Channel.objects.select_related('logo', 'channel_group').get(id=channel_id)
         except Channel.DoesNotExist:
             raise Http404()
-
-        # Get category_id from request for filtering
-        category_id = request.GET.get("category_id")
 
         # Get recordings for this channel accessible to user
         if is_in_progress_series:
@@ -2099,25 +2075,13 @@ def xc_get_series_info(request, user, series_id):
                 ), user
             ).select_related("channel").order_by("-start_time")
 
-        # Filter by category_id if it's a date category (format: -YYYYMMDD)
-        if category_id and category_id.startswith("-") and category_id != "-1" and not is_in_progress_series:
-            date_num = category_id[1:]
-            if len(date_num) == 8 and date_num.isdigit():
-                try:
-                    year = int(date_num[:4])
-                    month = int(date_num[4:6])
-                    day = int(date_num[6:8])
-                    # Create date range in display timezone, then convert to UTC for DB query
-                    target_date_display = datetime(year, month, day, tzinfo=display_tz)
-                    next_day_display = target_date_display + timedelta(days=1)
-                    target_start_utc = target_date_display.astimezone(dt_timezone.utc)
-                    target_end_utc = next_day_display.astimezone(dt_timezone.utc)
-                    recordings = recordings.filter(
-                        start_time__gte=target_start_utc,
-                        start_time__lt=target_end_utc,
-                    )
-                except (ValueError, IndexError):
-                    recordings = recordings.none()
+            if series_date:
+                # Restrict to the local calendar day encoded in the series id
+                start_utc, end_utc = _local_day_bounds_utc(series_date, display_tz)
+                recordings = recordings.filter(
+                    start_time__gte=start_utc,
+                    start_time__lt=end_utc,
+                )
 
         # Build episodes from recordings
         seasons = {}
@@ -2230,19 +2194,24 @@ def xc_get_series_info(request, user, series_id):
             series_name = f"{channel.name} (In Progress)"
             series_plot = f"In-progress DVR recordings from {channel.name}"
         else:
-            # Completed series gets date category from most recent recording
-            completed_rec = recordings.filter(
-                custom_properties__has_key="file_path",
-                start_time__isnull=False
-            ).order_by('-start_time').first()
-            if completed_rec and completed_rec.start_time:
-                # Convert UTC start_time to display timezone for correct date
-                local_time = completed_rec.start_time.astimezone(display_tz)
-                cat_id = f"-{local_time.year}{local_time.month:02d}{local_time.day:02d}"
+            if series_date:
+                # Date series: category comes straight from the date in the series id
+                cat_id = f"-{series_date.strftime('%Y%m%d')}"
+                series_plot = f"DVR recordings from {channel.name} on {series_date.strftime('%d-%b-%Y').upper()}"
             else:
-                cat_id = "-999"
+                # Legacy completed series: date category from most recent recording
+                completed_rec = recordings.filter(
+                    custom_properties__has_key="file_path",
+                    start_time__isnull=False
+                ).order_by('-start_time').first()
+                if completed_rec and completed_rec.start_time:
+                    # Convert UTC start_time to display timezone for correct date
+                    local_time = completed_rec.start_time.astimezone(display_tz)
+                    cat_id = f"-{local_time.year}{local_time.month:02d}{local_time.day:02d}"
+                else:
+                    cat_id = "-999"
+                series_plot = f"DVR recordings from {channel.name}"
             series_name = channel.name
-            series_plot = f"DVR recordings from {channel.name}"
 
         info = {
             'seasons': seasons_list,
