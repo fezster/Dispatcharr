@@ -1748,21 +1748,20 @@ def xc_get_series_categories(user):
 
     # Add DVR categories if user has DVR view permission
     if is_dvr_view_enabled(user=user):
-        # Check for in-progress recordings (doesn't need channel)
+        # Keep the category available even before the first recording so XC
+        # clients can discover the In Progress series.
+        response.append({
+            "category_id": "-1",
+            "category_name": "In Progress",
+            "parent_id": 0,
+        })
+
         in_progress_qs = recordings_queryset_for_user(
             Recording.objects.filter(
                 Q(custom_properties__has_key="_hls_dir") |
                 Q(custom_properties__has_key="file_path")
             ), user
         )
-        has_in_progress = in_progress_qs.filter(custom_properties__has_key="_hls_dir").exists()
-        if has_in_progress:
-            response.append({
-                "category_id": "-1",  # Numeric ID for TiviMate compatibility
-                "category_name": "In Progress",
-                "parent_id": 0,
-            })
-
         # Get unique dates for completed recordings (use values_list to avoid select_related conflict)
         completed_dates = in_progress_qs.filter(
             custom_properties__has_key="file_path"
@@ -1884,6 +1883,7 @@ def xc_get_series(request, user, category_id=None):
                 Q(custom_properties__has_key="file_path")
             ), user
         ).select_related("channel", "channel__logo", "channel__channel_group")
+        has_dvr_recordings = recordings_qs.exists()
 
         # Filter recordings based on category
         if category_id == "-1":
@@ -1913,8 +1913,29 @@ def xc_get_series(request, user, category_id=None):
                 recordings_qs = recordings_qs.none()
 
         # Group by channel
+        has_in_progress_recordings = recordings_qs.filter(
+            custom_properties__has_key="_hls_dir"
+        ).exists()
         channel_ids = recordings_qs.values_list('channel_id', flat=True).distinct()
         channels = Channel.objects.filter(id__in=channel_ids).select_related('logo', 'channel_group')
+
+        # A series needs a channel ID so xc_get_series_info can resolve it.
+        # When there are no recordings (or no in-progress recordings for the
+        # In Progress category), use one visible channel to host the placeholder.
+        add_placeholder_series = (
+            (category_id is None and not has_dvr_recordings)
+            or (category_id == "-1" and not has_in_progress_recordings)
+        )
+        if add_placeholder_series:
+            visible_channels = Channel.objects.filter(user_level__lte=user.user_level)
+            if user.user_level < 10 and user.channel_profiles.exists():
+                visible_channels = visible_channels.filter(
+                    channelprofilemembership__enabled=True,
+                    channelprofilemembership__channel_profile__in=user.channel_profiles.all(),
+                ).distinct()
+            if (user.custom_properties or {}).get('hide_adult_content', False):
+                visible_channels = visible_channels.filter(is_adult=False)
+            channels = visible_channels.order_by('id')[:1].select_related('logo', 'channel_group')
 
         # Precompute channel logo URL parts
         base_url = build_absolute_uri_with_port(request, "")
@@ -1946,16 +1967,20 @@ def xc_get_series(request, user, category_id=None):
 
             # --- In Progress series ---
             if category_id is None or category_id == "-1":
-                if channel_recordings.filter(custom_properties__has_key="_hls_dir").exists():
+                channel_has_in_progress = channel_recordings.filter(
+                    custom_properties__has_key="_hls_dir"
+                ).exists()
+                if channel_has_in_progress or add_placeholder_series:
                     num += 1
                     # In Progress series: unique series_id (offset by -1000000)
                     in_progress_series_id = -channel.id - 1000000
+                    is_placeholder_series = add_placeholder_series and not channel_has_in_progress
                     append({
                         "num": num,
-                        "name": f"{channel.name} (In Progress)",
+                        "name": "No recordings available" if is_placeholder_series else f"{channel.name} (In Progress)",
                         "series_id": in_progress_series_id,
-                        "cover": cover,
-                        "plot": f"In-progress DVR recordings from {channel.name}",
+                        "cover": None if is_placeholder_series else cover,
+                        "plot": "There are no in-progress recordings." if is_placeholder_series else f"In-progress DVR recordings from {channel.name}",
                         "cast": "",
                         "director": "",
                         "genre": group_name,
@@ -2192,9 +2217,47 @@ def xc_get_series_info(request, user, series_id):
                 }
             })
 
+        # Empty In Progress series still need one episode entry for XC clients
+        # that hide series without recordings. The placeholder has no source
+        # URL and is only shown when this channel has no in-progress recording.
+        if is_in_progress_series and not recordings.exists():
+            now = django_timezone.now().astimezone(display_tz)
+            season_num = now.year
+            placeholder_title = "No recordings available"
+            seasons[season_num] = [{
+                "id": 0,
+                "season": season_num,
+                "episode_num": 1,
+                "title": placeholder_title,
+                "container_extension": "mp4",
+                "added": str(int(now.timestamp())),
+                "custom_sid": "",
+                "direct_source": "",
+                "info": {
+                    "id": 0,
+                    "name": placeholder_title,
+                    "overview": "There are no in-progress recordings.",
+                    "plot": "There are no in-progress recordings.",
+                    "crew": "",
+                    "directed_by": "",
+                    "imdb_id": "",
+                    "air_date": now.strftime("%Y-%m-%d %H:%M:%S"),
+                    "backdrop_path": [],
+                    "movie_image": None,
+                    "rating": "0",
+                    "release_date": now.strftime("%Y-%m-%d %H:%M:%S"),
+                    "releasedate": now.strftime("%Y-%m-%d"),
+                    "duration_secs": 0,
+                    "duration": "00:00:00",
+                    "video": [],
+                    "audio": [],
+                    "bitrate": 0,
+                },
+            }]
+
         logo = channel.logo
         series_cover = None
-        if logo:
+        if logo and not (is_in_progress_series and not recordings.exists()):
             series_cover = f"{_logo_url_prefix}{logo.id}{_logo_url_suffix}"
 
         # Complete season entries (id, episode_count, air_date, overview, cover, cover_big)
@@ -2231,8 +2294,12 @@ def xc_get_series_info(request, user, series_id):
         if is_in_progress_series:
             # In Progress series always has category -1
             cat_id = "-1"
-            series_name = f"{channel.name} (In Progress)"
-            series_plot = f"In-progress DVR recordings from {channel.name}"
+            if not recordings.exists():
+                series_name = "No recordings available"
+                series_plot = "There are no in-progress recordings."
+            else:
+                series_name = f"{channel.name} (In Progress)"
+                series_plot = f"In-progress DVR recordings from {channel.name}"
         else:
             if series_date:
                 # Date series: category comes straight from the date in the series id
