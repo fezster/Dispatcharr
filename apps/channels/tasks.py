@@ -1430,6 +1430,7 @@ def _build_output_paths(channel, program, start_time, end_time, recording_id):
             fallback_values = {
                 **values,
                 'original_air_date': original_air_date,
+                'channel_id': channel.id,
             }
             rel_path = tv_fb.format(**fallback_values)
         except Exception:
