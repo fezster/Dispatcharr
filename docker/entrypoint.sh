@@ -456,7 +456,9 @@ fi
 # Launch uwsgi (UWSGI_NICE_LEVEL, default 0). su -/pam_limits resets soft nofile
 # to 1024; raise it inside the session. Guarded so a bad value cannot abort set -e.
 DISPATCHARR_NOFILE="${DISPATCHARR_NOFILE:-65536}"
-nice -n "$UWSGI_NICE_LEVEL" su - "$POSTGRES_USER" -c "ulimit -n $DISPATCHARR_NOFILE 2>/dev/null || true; cd /app && exec $VIRTUAL_ENV/bin/uwsgi $uwsgi_args" & uwsgi_pid=$!
+# Set UTF-8 mode before uWSGI initializes Python and after su resets the environment.
+# The web workers must be able to open recording paths containing Unicode.
+nice -n "$UWSGI_NICE_LEVEL" su - "$POSTGRES_USER" -c "ulimit -n $DISPATCHARR_NOFILE 2>/dev/null || true; cd /app && exec env PYTHONUTF8=1 $VIRTUAL_ENV/bin/uwsgi $uwsgi_args" & uwsgi_pid=$!
 echo "✅ uwsgi started with PID $uwsgi_pid (nice $UWSGI_NICE_LEVEL, nofile $DISPATCHARR_NOFILE)"
 pids+=("$uwsgi_pid"); pid_names[$uwsgi_pid]="uwsgi"
 
